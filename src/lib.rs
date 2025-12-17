@@ -34,6 +34,7 @@ type DefaultBuildHasher = std::hash::RandomState;
 pub struct Cache<K, V, S = DefaultBuildHasher> {
     entries: *const [Bucket<(K, V)>],
     build_hasher: S,
+    drop: bool,
 }
 
 impl<K, V, S> core::fmt::Debug for Cache<K, V, S> {
@@ -51,6 +52,20 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
+    /// Create a new cache with the specified number of entries and hasher.
+    ///
+    /// Dynamically allocates memory for the cache entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num` is not a power of two.
+    pub fn new(num: usize, build_hasher: S) -> Self {
+        let bytes = num * size_of::<Bucket<(K, V)>>();
+        let raw = Box::into_raw(vec![0u8; bytes].into_boxed_slice());
+        let cast = std::ptr::slice_from_raw_parts_mut(raw.cast(), num);
+        Self::new_inner(cast, build_hasher, false)
+    }
+
     /// Creates a new cache with the specified entries and hasher.
     ///
     /// # Panics
@@ -58,8 +73,13 @@ where
     /// Panics if `entries.len()` is not a power of two.
     #[inline]
     pub const fn new_static(entries: &'static [Bucket<(K, V)>], build_hasher: S) -> Self {
+        Self::new_inner(entries, build_hasher, false)
+    }
+
+    #[inline]
+    const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
         assert!(entries.len().is_power_of_two());
-        Self { entries, build_hasher }
+        Self { entries, build_hasher, drop }
     }
 
     #[inline]
@@ -93,7 +113,7 @@ where
     V: Clone,
     S: BuildHasher,
 {
-    /// Get
+    /// Get an entry from the cache.
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
         self.get_inner(key, bucket, tag)
@@ -121,7 +141,7 @@ where
         None
     }
 
-    /// Insert
+    /// Insert an entry into the cache.
     pub fn insert(&self, key: K, value: V) {
         let (bucket, tag) = self.calc(&key);
         self.insert_inner(|| key, || value, bucket, tag);
@@ -213,6 +233,14 @@ where
     }
 }
 
+impl<K, V, S> Drop for Cache<K, V, S> {
+    fn drop(&mut self) {
+        if self.drop {
+            drop(unsafe { Box::from_raw(self.entries.cast_mut()) });
+        }
+    }
+}
+
 /// A cache bucket.
 #[repr(C, align(128))]
 pub struct Bucket<T> {
@@ -264,10 +292,14 @@ unsafe impl<T: Send> Sync for Bucket<T> {}
 ///
 /// type BuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
 ///
-/// static MY_CACHE: Cache<u64, String, BuildHasher> =
-///     static_cache!(u64, String, 1024, BuildHasher::new());
+/// static MY_CACHE: Cache<u64, &'static str, BuildHasher> =
+///     static_cache!(u64, &'static str, 1024, BuildHasher::new());
 ///
-/// let value = MY_CACHE.get_or_insert_with(&42, |k| k.to_string());
+/// let value = MY_CACHE.get_or_insert_with(&42, |_k| "hi");
+/// assert_eq!(value, "hi");
+///
+/// let new_value = MY_CACHE.get_or_insert_with(&42, |_k| "not hi");
+/// assert_eq!(new_value, "not hi");
 /// # }
 /// ```
 #[macro_export]
