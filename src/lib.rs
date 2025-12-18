@@ -9,6 +9,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use equivalent::Equivalent;
+use std::convert::Infallible;
 
 const LOCKED_BIT: usize = 0x0000_8000;
 
@@ -212,16 +213,7 @@ where
     where
         F: FnOnce(&K) -> V,
     {
-        let mut key = std::mem::ManuallyDrop::new(key);
-        let mut read = false;
-        let r = self.get_or_insert_with_ref(&*key, f, |k| {
-            read = true;
-            unsafe { std::ptr::read(k) }
-        });
-        if !read {
-            unsafe { std::mem::ManuallyDrop::drop(&mut key) }
-        }
-        r
+        self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key))).unwrap()
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -240,13 +232,7 @@ where
         F: FnOnce(&'a Q) -> V,
         Cvt: FnOnce(&'a Q) -> K,
     {
-        let (bucket, tag) = self.calc(key);
-        if let Some(v) = self.get_inner(key, bucket, tag) {
-            return v;
-        }
-        let value = f(key);
-        self.insert_inner(|| cvt(key), || value.clone(), bucket, tag);
-        value
+        self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt).unwrap()
     }
 
     /// Gets a value from the cache, or attempts to insert one computed by `f` if not present.
