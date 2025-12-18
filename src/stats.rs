@@ -2,7 +2,7 @@ use core::{
     any::TypeId,
     sync::atomic::{AtomicU64, Ordering},
 };
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 /// A type-erased reference that can be downcast even for non-`'static` types.
 ///
@@ -63,7 +63,7 @@ impl core::fmt::Debug for AnyRef<'_> {
 /// Implement this trait to provide custom handling for cache hits, misses, and collisions.
 /// All methods have default implementations that do nothing, allowing you to override only
 /// the events you care about.
-pub trait StatsHandler<K, V>: Send + Sync {
+pub trait StatsHandler<K, V>: Any + Send + Sync {
     /// Called when a cache hit occurs (key found and value returned).
     fn on_hit(&self, _key: &K, _value: &V) {}
 
