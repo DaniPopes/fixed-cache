@@ -11,6 +11,7 @@ use core::{
 use equivalent::Equivalent;
 use std::convert::Infallible;
 
+const NEEDED_BITS: usize = 2;
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
 
@@ -91,7 +92,10 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `num` is not a power of two.
+    /// Panics if `num`:
+    /// - is not a power of two.
+    /// - isn't at least 4.
+    // See len_assertion for why.
     pub fn new(num: usize, build_hasher: S) -> Self {
         Self::len_assertion(num);
         let entries =
@@ -103,7 +107,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `entries.len()` is not a power of two.
+    /// See [`new`](Self::new).
     #[inline]
     pub const fn new_static(entries: &'static [Bucket<(K, V)>], build_hasher: S) -> Self {
         Self::len_assertion(entries.len());
@@ -117,7 +121,14 @@ where
 
     #[inline]
     const fn len_assertion(len: usize) {
-        assert!(len > 1 && len.is_power_of_two());
+        // We need `NEEDED_BITS` bits to store metadata for each entry.
+        // Since we calculate the tag mask based on the index mask, and the index mask is (len - 1),
+        // we assert that the length's bottom `NEEDED_BITS` bits are zero.
+        assert!(
+            (len & ((1 << NEEDED_BITS) - 1)) == 0,
+            "len must have its bottom N bits set to zero"
+        );
+        assert!(len.is_power_of_two(), "length must be a power of two");
     }
 
     #[inline]
