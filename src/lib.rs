@@ -195,12 +195,12 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) {
-        if bucket.try_lock(None) {
+        if let Some(prev_tag) = bucket.try_lock_ret(None) {
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
                 // Drop old value if bucket was alive.
-                if Self::NEEDS_DROP && bucket.is_alive() {
+                if Self::NEEDS_DROP && (prev_tag & ALIVE_BIT) != 0 {
                     core::ptr::drop_in_place(data);
                 }
                 (&raw mut (*data).0).write(make_key());
@@ -351,17 +351,22 @@ impl<T> Bucket<T> {
 
     #[inline]
     fn try_lock(&self, expected: Option<usize>) -> bool {
+        self.try_lock_ret(expected).is_some()
+    }
+
+    #[inline]
+    fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
             if state != expected {
-                return false;
+                return None;
             }
         } else if state & LOCKED_BIT != 0 {
-            return false;
+            return None;
         }
         self.tag
             .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .ok()
     }
 
     #[inline]
