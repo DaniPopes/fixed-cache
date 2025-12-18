@@ -2,14 +2,15 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(clippy::new_without_default)]
 
-use core::{
+use equivalent::Equivalent;
+use std::{
     cell::UnsafeCell,
+    convert::Infallible,
+    fmt,
     hash::{BuildHasher, Hash},
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use equivalent::Equivalent;
-use std::convert::Infallible;
 
 #[cfg(feature = "stats")]
 mod stats;
@@ -64,11 +65,11 @@ type DefaultBuildHasher = std::hash::RandomState;
 /// assert_eq!(value, 246);
 /// ```
 ///
-/// [`Hash`]: core::hash::Hash
-/// [`Eq`]: core::cmp::Eq
-/// [`Clone`]: core::clone::Clone
-/// [`Drop`]: core::ops::Drop
-/// [`BuildHasher`]: core::hash::BuildHasher
+/// [`Hash`]: std::hash::Hash
+/// [`Eq`]: std::cmp::Eq
+/// [`Clone`]: std::clone::Clone
+/// [`Drop`]: std::ops::Drop
+/// [`BuildHasher`]: std::hash::BuildHasher
 /// [`RandomState`]: std::hash::RandomState
 /// [`rapidhash`]: https://crates.io/crates/rapidhash
 pub struct Cache<K, V, S = DefaultBuildHasher> {
@@ -79,8 +80,8 @@ pub struct Cache<K, V, S = DefaultBuildHasher> {
     drop: bool,
 }
 
-impl<K, V, S> core::fmt::Debug for Cache<K, V, S> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<K, V, S> fmt::Debug for Cache<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cache").finish_non_exhaustive()
     }
 }
@@ -163,7 +164,7 @@ where
     #[inline]
     const fn index_mask(&self) -> usize {
         let n = self.capacity();
-        unsafe { core::hint::assert_unchecked(n.is_power_of_two()) };
+        unsafe { std::hint::assert_unchecked(n.is_power_of_two()) };
         n - 1
     }
 
@@ -257,7 +258,7 @@ where
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
                 // Drop old value if bucket was alive.
                 if Self::NEEDS_DROP && (prev_tag & ALIVE_BIT) != 0 {
-                    core::ptr::drop_in_place(data);
+                    std::ptr::drop_in_place(data);
                 }
                 (&raw mut (*data).0).write(make_key());
                 (&raw mut (*data).1).write(make_value());

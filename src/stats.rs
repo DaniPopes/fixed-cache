@@ -1,8 +1,12 @@
-use core::{
-    any::TypeId,
-    sync::atomic::{AtomicU64, Ordering},
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
-use std::{any::Any, sync::Arc};
 
 /// A type-erased reference that can be downcast even for non-`'static` types.
 ///
@@ -12,7 +16,7 @@ use std::{any::Any, sync::Arc};
 pub struct AnyRef<'a> {
     ptr: *const (),
     type_id: TypeId,
-    _marker: core::marker::PhantomData<&'a ()>,
+    _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> AnyRef<'a> {
@@ -22,7 +26,7 @@ impl<'a> AnyRef<'a> {
         Self {
             ptr: value as *const T as *const (),
             type_id: typeid::of::<T>(),
-            _marker: core::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -52,8 +56,8 @@ impl<'a> AnyRef<'a> {
     }
 }
 
-impl core::fmt::Debug for AnyRef<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Debug for AnyRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnyRef").field("type_id", &self.type_id).finish_non_exhaustive()
     }
 }
