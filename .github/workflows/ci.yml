@@ -36,22 +36,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
       - name: build
         run: cargo build
       - name: test
-        run: cargo nextest run --workspace
-      - name: test all features
-        if: matrix.rust == 'nightly'
-        run: cargo nextest run --workspace --all-features
+        run: cargo test --workspace
       - name: test --features nightly
         if: matrix.rust == 'nightly'
-        run: cargo nextest run --workspace --features nightly
-      - name: doctest
-        run: cargo test --doc --workspace --all-features
+        run: cargo test --workspace --features nightly
+      - name: test all features
+        if: matrix.rust == 'nightly'
+        run: cargo test --workspace --all-features
 
   feature-checks:
     name: features
