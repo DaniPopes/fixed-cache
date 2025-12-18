@@ -1,5 +1,5 @@
 use std::{
-    any::{Any, TypeId},
+    any::TypeId,
     fmt,
     marker::PhantomData,
     sync::{
