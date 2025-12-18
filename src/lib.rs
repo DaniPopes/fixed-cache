@@ -9,6 +9,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use equivalent::Equivalent;
+use std::convert::Infallible;
 
 const LOCKED_BIT: usize = 0x0000_8000;
 
@@ -212,16 +213,7 @@ where
     where
         F: FnOnce(&K) -> V,
     {
-        let mut key = std::mem::ManuallyDrop::new(key);
-        let mut read = false;
-        let r = self.get_or_insert_with_ref(&*key, f, |k| {
-            read = true;
-            unsafe { std::ptr::read(k) }
-        });
-        if !read {
-            unsafe { std::mem::ManuallyDrop::drop(&mut key) }
-        }
-        r
+        self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key))).unwrap()
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -240,13 +232,58 @@ where
         F: FnOnce(&'a Q) -> V,
         Cvt: FnOnce(&'a Q) -> K,
     {
+        self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt).unwrap()
+    }
+
+    /// Gets a value from the cache, or attempts to insert one computed by `f` if not present.
+    ///
+    /// If the key is found in the cache, returns `Ok` with a clone of the cached value.
+    /// Otherwise, calls `f` to compute the value. If `f` returns `Ok`, attempts to insert
+    /// the value and returns it. If `f` returns `Err`, the error is propagated.
+    #[inline]
+    pub fn get_or_try_insert_with<F, E>(&self, key: K, f: F) -> Result<V, E>
+    where
+        F: FnOnce(&K) -> Result<V, E>,
+    {
+        let mut key = std::mem::ManuallyDrop::new(key);
+        let mut read = false;
+        let r = self.get_or_try_insert_with_ref(&*key, f, |k| {
+            read = true;
+            unsafe { std::ptr::read(k) }
+        });
+        if !read {
+            unsafe { std::mem::ManuallyDrop::drop(&mut key) }
+        }
+        r
+    }
+
+    /// Gets a value from the cache, or attempts to insert one computed by `f` if not present.
+    ///
+    /// If the key is found in the cache, returns `Ok` with a clone of the cached value.
+    /// Otherwise, calls `f` to compute the value. If `f` returns `Ok`, attempts to insert
+    /// the value and returns it. If `f` returns `Err`, the error is propagated.
+    ///
+    /// This is the same as [`Self::get_or_try_insert_with`], but takes a reference to the key, and
+    /// a function to get the key reference to an owned key.
+    #[inline]
+    pub fn get_or_try_insert_with_ref<'a, Q, F, Cvt, E>(
+        &self,
+        key: &'a Q,
+        f: F,
+        cvt: Cvt,
+    ) -> Result<V, E>
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+        F: FnOnce(&'a Q) -> Result<V, E>,
+        Cvt: FnOnce(&'a Q) -> K,
+    {
         let (bucket, tag) = self.calc(key);
         if let Some(v) = self.get_inner(key, bucket, tag) {
-            return v;
+            return Ok(v);
         }
-        let value = f(key);
+        let value = f(key)?;
         self.insert_inner(|| cvt(key), || value.clone(), bucket, tag);
-        value
+        Ok(value)
     }
 
     #[inline]
@@ -683,5 +720,62 @@ mod tests {
         assert_sync::<Cache<u64, u64>>();
         assert_send::<Bucket<(u64, u64)>>();
         assert_sync::<Bucket<(u64, u64)>>();
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_ok() {
+        let cache = new_cache(1024);
+
+        let mut computed = false;
+        let result: Result<u64, &str> = cache.get_or_try_insert_with(42, |&k| {
+            computed = true;
+            Ok(k * 2)
+        });
+        assert!(computed);
+        assert_eq!(result, Ok(84));
+
+        computed = false;
+        let result: Result<u64, &str> = cache.get_or_try_insert_with(42, |&k| {
+            computed = true;
+            Ok(k * 2)
+        });
+        assert!(!computed);
+        assert_eq!(result, Ok(84));
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_err() {
+        let cache: Cache<u64, u64> = new_cache(1024);
+
+        let result: Result<u64, &str> = cache.get_or_try_insert_with(42, |_| Err("failed"));
+        assert_eq!(result, Err("failed"));
+
+        assert_eq!(cache.get(&42), None);
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_ref_ok() {
+        let cache: Cache<&'static str, usize> = new_cache(64);
+
+        let key = "hello";
+        let result: Result<usize, &str> =
+            cache.get_or_try_insert_with_ref(key, |s| Ok(s.len()), |s| s);
+        assert_eq!(result, Ok(5));
+
+        let result2: Result<usize, &str> =
+            cache.get_or_try_insert_with_ref(key, |_| Ok(999), |s| s);
+        assert_eq!(result2, Ok(5));
+    }
+
+    #[test]
+    fn test_get_or_try_insert_with_ref_err() {
+        let cache: Cache<&'static str, usize> = new_cache(64);
+
+        let key = "hello";
+        let result: Result<usize, &str> =
+            cache.get_or_try_insert_with_ref(key, |_| Err("failed"), |s| s);
+        assert_eq!(result, Err("failed"));
+
+        assert_eq!(cache.get(&key), None);
     }
 }
