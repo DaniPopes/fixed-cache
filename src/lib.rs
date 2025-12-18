@@ -124,11 +124,11 @@ where
         // We need `NEEDED_BITS` bits to store metadata for each entry.
         // Since we calculate the tag mask based on the index mask, and the index mask is (len - 1),
         // we assert that the length's bottom `NEEDED_BITS` bits are zero.
+        assert!(len.is_power_of_two(), "length must be a power of two");
         assert!(
             (len & ((1 << NEEDED_BITS) - 1)) == 0,
             "len must have its bottom N bits set to zero"
         );
-        assert!(len.is_power_of_two(), "length must be a power of two");
     }
 
     #[inline]
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_get_or_insert() {
+    fn basic_get_or_insert() {
         let cache = new_cache(1024);
 
         let mut computed = false;
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_different_keys() {
+    fn different_keys() {
         let cache: Cache<String, usize> = new_cache(1024);
 
         let v1 = cache.get_or_insert_with("hello".to_string(), |s| s.len());
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_dynamic_allocation() {
+    fn new_dynamic_allocation() {
         let cache: Cache<u32, u32> = new_cache(64);
         assert_eq!(cache.capacity(), 64);
 
@@ -496,13 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_miss() {
+    fn get_miss() {
         let cache = new_cache::<u64, u64>(64);
         assert_eq!(cache.get(&999), None);
     }
 
     #[test]
-    fn test_insert_and_get() {
+    fn insert_and_get() {
         let cache: Cache<u64, String> = new_cache(64);
 
         cache.insert(1, "one".to_string());
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_twice() {
+    fn insert_twice() {
         let cache = new_cache(64);
 
         cache.insert(42, 1);
@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_insert_with_ref() {
+    fn get_or_insert_with_ref() {
         let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_insert_with_ref_different_keys() {
+    fn get_or_insert_with_ref_different_keys() {
         let cache: Cache<String, usize> = new_cache(1024);
 
         let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s.to_string());
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capacity() {
+    fn capacity() {
         let cache = new_cache::<u64, u64>(256);
         assert_eq!(cache.capacity(), 256);
 
@@ -560,26 +560,26 @@ mod tests {
     }
 
     #[test]
-    fn test_hasher() {
+    fn hasher() {
         let cache = new_cache::<u64, u64>(64);
         let _ = cache.hasher();
     }
 
     #[test]
-    fn test_debug_impl() {
+    fn debug_impl() {
         let cache = new_cache::<u64, u64>(64);
         let debug_str = format!("{:?}", cache);
         assert!(debug_str.contains("Cache"));
     }
 
     #[test]
-    fn test_bucket_new() {
+    fn bucket_new() {
         let bucket: Bucket<(u64, u64)> = Bucket::new();
         assert_eq!(bucket.tag.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_many_entries() {
+    fn many_entries() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(500);
 
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_string_keys() {
+    fn string_keys() {
         let cache: Cache<String, i32> = new_cache(1024);
 
         cache.insert("alpha".to_string(), 1);
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_values() {
+    fn zero_values() {
         let cache: Cache<u64, u64> = new_cache(64);
 
         cache.insert(0, 0);
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_value() {
+    fn clone_value() {
         #[derive(Clone, PartialEq, Debug)]
         struct MyValue(u64);
 
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_reads() {
+    fn concurrent_reads() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_writes() {
+    fn concurrent_writes() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -673,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_read_write() {
+    fn concurrent_read_write() {
         let cache: Cache<u64, u64> = new_cache(256);
         let n = iters(1000);
 
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_get_or_insert() {
+    fn concurrent_get_or_insert() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -707,14 +707,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_non_power_of_two_panics() {
+    #[should_panic = "power of two"]
+    fn non_power_of_two() {
         let _ = new_cache::<u64, u64>(100);
     }
 
     #[test]
-    fn test_power_of_two_sizes() {
-        for shift in 1..10 {
+    #[should_panic = "len must have its bottom N bits set to zero"]
+    fn small_cache() {
+        let _ = new_cache::<u64, u64>(2);
+    }
+
+    #[test]
+    fn power_of_two_sizes() {
+        for shift in 2..10 {
             let size = 1 << shift;
             let cache = new_cache::<u64, u64>(size);
             assert_eq!(cache.capacity(), size);
@@ -722,20 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn test_small_cache() {
-        let cache = new_cache(2);
-        assert_eq!(cache.capacity(), 2);
-
-        cache.insert(1, 10);
-        cache.insert(2, 20);
-        cache.insert(3, 30);
-
-        let count = [1, 2, 3].iter().filter(|&&k| cache.get(&k).is_some()).count();
-        assert!(count <= 2);
-    }
-
-    #[test]
-    fn test_equivalent_key_lookup() {
+    fn equivalent_key_lookup() {
         let cache: Cache<String, i32> = new_cache(64);
 
         cache.insert("hello".to_string(), 42);
@@ -744,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_large_values() {
+    fn large_values() {
         let cache: Cache<u64, [u8; 1000]> = new_cache(64);
 
         let large_value = [42u8; 1000];
@@ -754,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_sync() {
+    fn send_sync() {
         fn assert_send<T: Send>() {}
         fn assert_sync<T: Sync>() {}
 
@@ -765,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ok() {
+    fn get_or_try_insert_with_ok() {
         let cache = new_cache(1024);
 
         let mut computed = false;
@@ -786,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_err() {
+    fn get_or_try_insert_with_err() {
         let cache: Cache<u64, u64> = new_cache(1024);
 
         let result: Result<u64, &str> = cache.get_or_try_insert_with(42, |_| Err("failed"));
@@ -796,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ref_ok() {
+    fn get_or_try_insert_with_ref_ok() {
         let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
@@ -810,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ref_err() {
+    fn get_or_try_insert_with_ref_err() {
         let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
@@ -822,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_on_cache_drop() {
+    fn drop_on_cache_drop() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -857,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_on_eviction() {
+    fn drop_on_eviction() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
