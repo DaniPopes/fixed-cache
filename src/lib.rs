@@ -464,11 +464,11 @@ impl<T> Drop for Bucket<T> {
 /// static MY_CACHE: Cache<u64, &'static str, BuildHasher> =
 ///     static_cache!(u64, &'static str, 1024, BuildHasher::new());
 ///
-/// let value = MY_CACHE.get_or_insert_with(&42, |_k| "hi");
+/// let value = MY_CACHE.get_or_insert_with(42, |_k| "hi");
 /// assert_eq!(value, "hi");
 ///
-/// let new_value = MY_CACHE.get_or_insert_with(&42, |_k| "not hi");
-/// assert_eq!(new_value, "not hi");
+/// let new_value = MY_CACHE.get_or_insert_with(42, |_k| "not hi");
+/// assert_eq!(new_value, "hi");
 /// # }
 /// ```
 #[macro_export]

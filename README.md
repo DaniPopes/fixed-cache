@@ -76,12 +76,12 @@ This design is ideal for memoization caches where:
 
 - **No iteration**: You cannot iterate over cached entries
 - **No removal**: Individual entries cannot be explicitly removed
-- **No `Drop`**: Key and value types must not implement `Drop` (use `Copy` types or references)
 - **Eviction on collision**: Hash collisions cause immediate eviction
 
 ## Feature Flags
 
 - `rapidhash` - Use [rapidhash](https://crates.io/crates/rapidhash) for faster hashing (recommended)
+- `stats` - Enable statistics tracking (hits, misses, collisions) via custom handlers
 - `nightly` - Enable nightly-only optimizations
 
 ## License
