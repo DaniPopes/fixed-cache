@@ -65,20 +65,30 @@ impl core::fmt::Debug for AnyRef<'_> {
 /// the events you care about.
 pub trait StatsHandler<K, V>: Any + Send + Sync {
     /// Called when a cache hit occurs (key found and value returned).
-    fn on_hit(&self, _key: &K, _value: &V) {}
+    fn on_hit(&self, key: &K, value: &V) {
+        let _ = key;
+        let _ = value;
+    }
 
     /// Called when a cache miss occurs (key not found).
     ///
-    /// The `key` parameter is a type-erased reference to the lookup key, which may be a
-    /// different type than `K` when using the [`Equivalent`](equivalent::Equivalent) trait.
-    /// Use [`AnyRef::downcast_ref`] to retrieve the concrete type if needed.
-    fn on_miss(&self, _key: AnyRef<'_>) {}
+    /// The `key` parameter is a type-erased reference to the lookup key (`Q`), which may be a
+    /// different type than `K`.
+    fn on_miss(&self, key: AnyRef<'_>) {
+        let _ = key;
+    }
 
     /// Called when a collision occurs (same bucket, different key - entry will be evicted).
     ///
-    /// The `new_key` parameter is a type-erased reference to the lookup key, which may be a
-    /// different type than `K` when using the [`Equivalent`](equivalent::Equivalent) trait.
-    fn on_collision(&self, _new_key: AnyRef<'_>, _existing_key: &K, _existing_value: &V) {}
+    /// Note that `on_miss` is also called after a collision.
+    ///
+    /// The `key` parameter is a type-erased reference to the lookup key (`Q`), which may be a
+    /// different type than `K`.
+    fn on_collision(&self, new_key: AnyRef<'_>, existing_key: &K, existing_value: &V) {
+        let _ = new_key;
+        let _ = existing_key;
+        let _ = existing_value;
+    }
 }
 
 /// Default statistics handler that tracks counts using atomic integers.
