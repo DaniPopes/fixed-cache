@@ -67,7 +67,7 @@ impl fmt::Debug for AnyRef<'_> {
 /// Implement this trait to provide custom handling for cache hits, misses, and collisions.
 /// All methods have default implementations that do nothing, allowing you to override only
 /// the events you care about.
-pub trait StatsHandler<K, V>: Any + Send + Sync {
+pub trait StatsHandler<K, V>: Send + Sync {
     /// Called when a cache hit occurs (key found and value returned).
     fn on_hit(&self, key: &K, value: &V) {
         let _ = key;
