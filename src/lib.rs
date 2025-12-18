@@ -11,7 +11,8 @@ use core::{
 use equivalent::Equivalent;
 use std::convert::Infallible;
 
-const LOCKED_BIT: usize = 0x0000_8000;
+const LOCKED_BIT: usize = 1 << 0;
+const ALIVE_BIT: usize = 1 << 1;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
@@ -30,15 +31,13 @@ type DefaultBuildHasher = std::hash::RandomState;
 ///
 /// # Limitations
 ///
-/// - **No `Drop` support**: Key and value types must not implement `Drop`. Use `Copy` types,
-///   primitives, or `&'static` references.
-/// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is lost.
+/// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 /// - **No iteration or removal**: Individual entries cannot be enumerated or explicitly removed.
 ///
 /// # Type Parameters
 ///
-/// - `K`: The key type. Must implement [`Hash`] + [`Eq`] and must not implement [`Drop`].
-/// - `V`: The value type. Must implement [`Clone`] and must not implement [`Drop`].
+/// - `K`: The key type. Must implement [`Hash`] + [`Eq`].
+/// - `V`: The value type. Must implement [`Clone`].
 /// - `S`: The hash builder type. Must implement [`BuildHasher`]. Defaults to [`RandomState`] or
 ///   [`rapidhash`] if the `rapidhash` feature is enabled.
 ///
@@ -94,7 +93,7 @@ where
     ///
     /// Panics if `num` is not a power of two.
     pub fn new(num: usize, build_hasher: S) -> Self {
-        assert!(num.is_power_of_two(), "capacity must be a power of two");
+        Self::len_assertion(num);
         let entries =
             Box::into_raw((0..num).map(|_| Bucket::new()).collect::<Vec<_>>().into_boxed_slice());
         Self::new_inner(entries, build_hasher, true)
@@ -107,17 +106,18 @@ where
     /// Panics if `entries.len()` is not a power of two.
     #[inline]
     pub const fn new_static(entries: &'static [Bucket<(K, V)>], build_hasher: S) -> Self {
+        Self::len_assertion(entries.len());
         Self::new_inner(entries, build_hasher, false)
     }
 
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
-        const {
-            assert!(!std::mem::needs_drop::<K>(), "dropping keys is not supported yet");
-            assert!(!std::mem::needs_drop::<V>(), "dropping values is not supported yet");
-        }
-        assert!(entries.len().is_power_of_two());
         Self { entries, build_hasher, drop }
+    }
+
+    #[inline]
+    const fn len_assertion(len: usize) {
+        assert!(len > 1 && len.is_power_of_two());
     }
 
     #[inline]
@@ -151,6 +151,8 @@ where
     V: Clone,
     S: BuildHasher,
 {
+    const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+
     /// Get an entry from the cache.
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
@@ -165,7 +167,7 @@ where
         tag: usize,
     ) -> Option<V> {
         if bucket.try_lock(Some(tag)) {
-            // SAFETY: We hold the lock, so we have exclusive access.
+            // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
                 let v = v.clone();
@@ -197,6 +199,10 @@ where
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
+                // Drop old value if bucket was alive.
+                if Self::NEEDS_DROP && bucket.is_alive() {
+                    core::ptr::drop_in_place(data);
+                }
                 (&raw mut (*data).0).write(make_key());
                 (&raw mut (*data).1).write(make_value());
             }
@@ -291,7 +297,10 @@ where
         let hash = self.hash_key(key);
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-        let tag = hash & self.tag_mask();
+        let mut tag = hash & self.tag_mask();
+        if Self::NEEDS_DROP {
+            tag |= ALIVE_BIT;
+        }
         (bucket, tag)
     }
 
@@ -310,6 +319,7 @@ where
 impl<K, V, S> Drop for Cache<K, V, S> {
     fn drop(&mut self) {
         if self.drop {
+            // SAFETY: `Drop` has exclusive access.
             drop(unsafe { Box::from_raw(self.entries.cast_mut()) });
         }
     }
@@ -331,6 +341,8 @@ pub struct Bucket<T> {
 }
 
 impl<T> Bucket<T> {
+    const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
+
     /// Creates a new zeroed bucket.
     #[inline]
     pub const fn new() -> Self {
@@ -353,6 +365,11 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
+    fn is_alive(&self) -> bool {
+        self.tag.load(Ordering::Relaxed) & ALIVE_BIT != 0
+    }
+
+    #[inline]
     fn unlock(&self, tag: usize) {
         self.tag.store(tag, Ordering::Release);
     }
@@ -361,6 +378,15 @@ impl<T> Bucket<T> {
 // SAFETY: `Bucket` is a specialized `Mutex<T>` that never blocks.
 unsafe impl<T: Send> Send for Bucket<T> {}
 unsafe impl<T: Send> Sync for Bucket<T> {}
+
+impl<T> Drop for Bucket<T> {
+    fn drop(&mut self) {
+        if Self::NEEDS_DROP && self.is_alive() {
+            // SAFETY: `Drop` has exclusive access.
+            unsafe { self.data.get_mut().assume_init_drop() };
+        }
+    }
+}
 
 /// Declares a static cache with the given name, key type, value type, and size.
 ///
@@ -777,5 +803,77 @@ mod tests {
         assert_eq!(result, Err("failed"));
 
         assert_eq!(cache.get(&key), None);
+    }
+
+    #[test]
+    fn test_drop_on_cache_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            cache.insert(DropKey(2), DropValue(200));
+            cache.insert(DropKey(3), DropValue(300));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+        }
+        // 3 keys + 3 values = 6 drops
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn test_drop_on_eviction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+            // Insert same key again - should evict old entry
+            cache.insert(DropKey(1), DropValue(200));
+            // Old key + old value dropped = 2
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+        }
+        // Cache dropped: new key + new value = 2 more
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 4);
     }
 }
