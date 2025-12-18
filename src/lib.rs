@@ -461,10 +461,10 @@ mod tests {
 
     #[test]
     fn test_different_keys() {
-        let cache: Cache<&'static str, usize> = static_cache!(&'static str, usize, 1024);
+        let cache: Cache<String, usize> = new_cache(1024);
 
-        let v1 = cache.get_or_insert_with("hello", |s| s.len());
-        let v2 = cache.get_or_insert_with("world!", |s| s.len());
+        let v1 = cache.get_or_insert_with("hello".to_string(), |s| s.len());
+        let v2 = cache.get_or_insert_with("world!".to_string(), |s| s.len());
 
         assert_eq!(v1, 5);
         assert_eq!(v2, 6);
@@ -487,15 +487,15 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let cache: Cache<u64, &'static str> = new_cache(64);
+        let cache: Cache<u64, String> = new_cache(64);
 
-        cache.insert(1, "one");
-        cache.insert(2, "two");
-        cache.insert(3, "three");
+        cache.insert(1, "one".to_string());
+        cache.insert(2, "two".to_string());
+        cache.insert(3, "three".to_string());
 
-        assert_eq!(cache.get(&1), Some("one"));
-        assert_eq!(cache.get(&2), Some("two"));
-        assert_eq!(cache.get(&3), Some("three"));
+        assert_eq!(cache.get(&1), Some("one".to_string()));
+        assert_eq!(cache.get(&2), Some("two".to_string()));
+        assert_eq!(cache.get(&3), Some("three".to_string()));
         assert_eq!(cache.get(&4), None);
     }
 
@@ -513,22 +513,22 @@ mod tests {
 
     #[test]
     fn test_get_or_insert_with_ref() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
-        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s);
+        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s.to_string());
         assert_eq!(value, 5);
 
-        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s);
+        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s.to_string());
         assert_eq!(value2, 5);
     }
 
     #[test]
     fn test_get_or_insert_with_ref_different_keys() {
-        let cache: Cache<&'static str, usize> = new_cache(1024);
+        let cache: Cache<String, usize> = new_cache(1024);
 
-        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s);
-        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s);
+        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s.to_string());
+        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s.to_string());
 
         assert_eq!(v1, 3);
         assert_eq!(v2, 6);
@@ -582,15 +582,15 @@ mod tests {
 
     #[test]
     fn test_string_keys() {
-        let cache: Cache<&'static str, i32> = new_cache(1024);
+        let cache: Cache<String, i32> = new_cache(1024);
 
-        cache.insert("alpha", 1);
-        cache.insert("beta", 2);
-        cache.insert("gamma", 3);
+        cache.insert("alpha".to_string(), 1);
+        cache.insert("beta".to_string(), 2);
+        cache.insert("gamma".to_string(), 3);
 
-        assert_eq!(cache.get(&"alpha"), Some(1));
-        assert_eq!(cache.get(&"beta"), Some(2));
-        assert_eq!(cache.get(&"gamma"), Some(3));
+        assert_eq!(cache.get("alpha"), Some(1));
+        assert_eq!(cache.get("beta"), Some(2));
+        assert_eq!(cache.get("gamma"), Some(3));
     }
 
     #[test]
@@ -720,11 +720,11 @@ mod tests {
 
     #[test]
     fn test_equivalent_key_lookup() {
-        let cache = new_cache(64);
+        let cache: Cache<String, i32> = new_cache(64);
 
-        cache.insert("hello", 42);
+        cache.insert("hello".to_string(), 42);
 
-        assert_eq!(cache.get(&"hello"), Some(42));
+        assert_eq!(cache.get("hello"), Some(42));
     }
 
     #[test]
@@ -781,28 +781,28 @@ mod tests {
 
     #[test]
     fn test_get_or_try_insert_with_ref_ok() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
         let result: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |s| Ok(s.len()), |s| s);
+            cache.get_or_try_insert_with_ref(key, |s| Ok(s.len()), |s| s.to_string());
         assert_eq!(result, Ok(5));
 
         let result2: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |_| Ok(999), |s| s);
+            cache.get_or_try_insert_with_ref(key, |_| Ok(999), |s| s.to_string());
         assert_eq!(result2, Ok(5));
     }
 
     #[test]
     fn test_get_or_try_insert_with_ref_err() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
         let result: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |_| Err("failed"), |s| s);
+            cache.get_or_try_insert_with_ref(key, |_| Err("failed"), |s| s.to_string());
         assert_eq!(result, Err("failed"));
 
-        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.get(key), None);
     }
 
     #[test]
