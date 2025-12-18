@@ -11,6 +11,12 @@ use core::{
 use equivalent::Equivalent;
 use std::convert::Infallible;
 
+#[cfg(feature = "stats")]
+mod stats;
+#[cfg(feature = "stats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
+pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
+
 const NEEDED_BITS: usize = 2;
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
@@ -68,6 +74,8 @@ type DefaultBuildHasher = std::hash::RandomState;
 pub struct Cache<K, V, S = DefaultBuildHasher> {
     entries: *const [Bucket<(K, V)>],
     build_hasher: S,
+    #[cfg(feature = "stats")]
+    stats: Option<Stats<K, V>>,
     drop: bool,
 }
 
@@ -114,9 +122,30 @@ where
         Self::new_inner(entries, build_hasher, false)
     }
 
+    /// Sets the cache's statistics.
+    #[cfg(feature = "stats")]
+    #[inline]
+    pub fn with_stats(mut self, stats: Option<Stats<K, V>>) -> Self {
+        self.set_stats(stats);
+        self
+    }
+
+    /// Sets the cache's statistics.
+    #[cfg(feature = "stats")]
+    #[inline]
+    pub fn set_stats(&mut self, stats: Option<Stats<K, V>>) {
+        self.stats = stats;
+    }
+
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
-        Self { entries, build_hasher, drop }
+        Self {
+            entries,
+            build_hasher,
+            #[cfg(feature = "stats")]
+            stats: None,
+            drop,
+        }
     }
 
     #[inline]
@@ -154,6 +183,12 @@ where
     pub const fn capacity(&self) -> usize {
         self.entries.len()
     }
+
+    /// Returns the statistics of this cache.
+    #[cfg(feature = "stats")]
+    pub const fn stats(&self) -> Option<&Stats<K, V>> {
+        self.stats.as_ref()
+    }
 }
 
 impl<K, V, S> Cache<K, V, S>
@@ -181,14 +216,24 @@ where
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
+                #[cfg(feature = "stats")]
+                if let Some(stats) = &self.stats {
+                    stats.record_hit(ck, v);
+                }
                 let v = v.clone();
                 bucket.unlock(tag);
                 return Some(v);
             }
+            #[cfg(feature = "stats")]
+            if let Some(stats) = &self.stats {
+                stats.record_collision(AnyRef::new(&key), ck, v);
+            }
             bucket.unlock(tag);
-            // Hash collision: same hash but different key.
         }
-
+        #[cfg(feature = "stats")]
+        if let Some(stats) = &self.stats {
+            stats.record_miss(AnyRef::new(&key));
+        }
         None
     }
 
