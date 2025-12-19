@@ -35,6 +35,10 @@ let cache: Cache<u64, u64> = Cache::new(1024, Default::default());
 cache.insert(42, 100);
 assert_eq!(cache.get(&42), Some(100));
 
+// Remove an entry
+assert_eq!(cache.remove(&42), Some(100));
+assert_eq!(cache.get(&42), None);
+
 // Use get_or_insert_with for lazy initialization
 let value = cache.get_or_insert_with(123, |&k| k * 2);
 assert_eq!(value, 246);
@@ -75,7 +79,6 @@ This design is ideal for memoization caches where:
 ## Limitations
 
 - **No iteration**: You cannot iterate over cached entries
-- **No removal**: Individual entries cannot be explicitly removed
 - **Eviction on collision**: Hash collisions cause immediate eviction
 
 ## Feature Flags
