@@ -244,6 +244,29 @@ where
         self.insert_inner(|| key, || value, bucket, tag);
     }
 
+    /// Remove an entry from the cache.
+    ///
+    /// Returns the value if the key was present in the cache.
+    pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
+        let (bucket, tag) = self.calc(key);
+        if bucket.try_lock(Some(tag)) {
+            // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
+            let data = unsafe { &mut *bucket.data.get() };
+            let (ck, v) = unsafe { data.assume_init_ref() };
+            if key.equivalent(ck) {
+                let v = v.clone();
+                if Self::NEEDS_DROP {
+                    // SAFETY: We hold the lock, so we have exclusive access.
+                    unsafe { data.assume_init_drop() };
+                }
+                bucket.unlock(0);
+                return Some(v);
+            }
+            bucket.unlock(tag);
+        }
+        None
+    }
+
     #[inline]
     fn insert_inner(
         &self,
@@ -571,6 +594,24 @@ mod tests {
         cache.insert(42, 2);
         let v = cache.get(&42);
         assert!(v == Some(1) || v == Some(2));
+    }
+
+    #[test]
+    fn remove_existing() {
+        let cache: Cache<u64, String> = new_cache(64);
+
+        cache.insert(1, "one".to_string());
+        assert_eq!(cache.get(&1), Some("one".to_string()));
+
+        let removed = cache.remove(&1);
+        assert_eq!(removed, Some("one".to_string()));
+        assert_eq!(cache.get(&1), None);
+    }
+
+    #[test]
+    fn remove_nonexistent() {
+        let cache = new_cache::<u64, u64>(64);
+        assert_eq!(cache.remove(&999), None);
     }
 
     #[test]
