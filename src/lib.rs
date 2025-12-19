@@ -40,7 +40,7 @@ type DefaultBuildHasher = std::hash::RandomState;
 /// # Limitations
 ///
 /// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
-/// - **No iteration or removal**: Individual entries cannot be enumerated or explicitly removed.
+/// - **No iteration**: Individual entries cannot be enumerated.
 ///
 /// # Type Parameters
 ///
