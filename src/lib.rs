@@ -445,7 +445,7 @@ impl<T> Bucket<T> {
             return None;
         }
         self.tag
-            .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
             .ok()
     }
 
