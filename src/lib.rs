@@ -8,6 +8,7 @@ use std::{
     convert::Infallible,
     fmt,
     hash::{BuildHasher, Hash},
+    marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -18,14 +19,37 @@ mod stats;
 #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
 pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
 
-const NEEDED_BITS: usize = 2;
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
+const NEEDED_BITS: usize = 2;
+
+const EPOCH_BITS: usize = 8;
+const EPOCH_SHIFT: usize = NEEDED_BITS;
+const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
+const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
 #[cfg(not(feature = "rapidhash"))]
 type DefaultBuildHasher = std::hash::RandomState;
+
+/// Configuration trait for [`Cache`].
+///
+/// This trait allows customizing cache behavior through compile-time configuration.
+pub trait CacheConfig {
+    /// Whether to track epochs for cheap invalidation via [`Cache::clear`].
+    ///
+    /// When enabled, the cache tracks an epoch counter that is incremented on each call to
+    /// [`Cache::clear`]. Entries are considered invalid if their epoch doesn't match the current
+    /// epoch, allowing O(1) invalidation of all entries without touching each bucket.
+    ///
+    /// Defaults to `false`.
+    const EPOCHS: bool = false;
+}
+
+/// Default cache configuration.
+pub struct DefaultCacheConfig(());
+impl CacheConfig for DefaultCacheConfig {}
 
 /// A concurrent, fixed-size, set-associative cache.
 ///
@@ -72,25 +96,27 @@ type DefaultBuildHasher = std::hash::RandomState;
 /// [`BuildHasher`]: std::hash::BuildHasher
 /// [`RandomState`]: std::hash::RandomState
 /// [`rapidhash`]: https://crates.io/crates/rapidhash
-pub struct Cache<K, V, S = DefaultBuildHasher> {
+pub struct Cache<K, V, S = DefaultBuildHasher, C: CacheConfig = DefaultCacheConfig> {
     entries: *const [Bucket<(K, V)>],
     build_hasher: S,
     #[cfg(feature = "stats")]
     stats: Option<Stats<K, V>>,
     drop: bool,
+    epoch: AtomicUsize,
+    _config: PhantomData<C>,
 }
 
-impl<K, V, S> fmt::Debug for Cache<K, V, S> {
+impl<K, V, S, C: CacheConfig> fmt::Debug for Cache<K, V, S, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Cache").finish_non_exhaustive()
     }
 }
 
 // SAFETY: `Cache` is safe to share across threads because `Bucket` uses atomic operations.
-unsafe impl<K: Send, V: Send, S: Send> Send for Cache<K, V, S> {}
-unsafe impl<K: Send, V: Send, S: Sync> Sync for Cache<K, V, S> {}
+unsafe impl<K: Send, V: Send, S: Send, C: CacheConfig + Send> Send for Cache<K, V, S, C> {}
+unsafe impl<K: Send, V: Send, S: Sync, C: CacheConfig + Sync> Sync for Cache<K, V, S, C> {}
 
-impl<K, V, S> Cache<K, V, S>
+impl<K, V, S, C: CacheConfig> Cache<K, V, S, C>
 where
     K: Hash + Eq,
     S: BuildHasher,
@@ -146,19 +172,19 @@ where
             #[cfg(feature = "stats")]
             stats: None,
             drop,
+            epoch: AtomicUsize::new(0),
+            _config: PhantomData,
         }
     }
 
     #[inline]
     const fn len_assertion(len: usize) {
-        // We need `NEEDED_BITS` bits to store metadata for each entry.
+        // We need `RESERVED_BITS` bits to store metadata for each entry.
         // Since we calculate the tag mask based on the index mask, and the index mask is (len - 1),
-        // we assert that the length's bottom `NEEDED_BITS` bits are zero.
+        // we assert that the length's bottom `RESERVED_BITS` bits are zero.
+        let reserved = if C::EPOCHS { EPOCH_NEEDED_BITS } else { NEEDED_BITS };
         assert!(len.is_power_of_two(), "length must be a power of two");
-        assert!(
-            (len & ((1 << NEEDED_BITS) - 1)) == 0,
-            "len must have its bottom N bits set to zero"
-        );
+        assert!((len & ((1 << reserved) - 1)) == 0, "len must have its bottom N bits set to zero");
     }
 
     #[inline]
@@ -171,6 +197,23 @@ where
     #[inline]
     const fn tag_mask(&self) -> usize {
         !self.index_mask()
+    }
+
+    /// Returns the current epoch of the cache.
+    ///
+    /// Only meaningful when [`CacheConfig::EPOCHS`] is `true`.
+    #[inline]
+    fn epoch(&self) -> usize {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Clears the cache by invalidating all entries.
+    ///
+    /// This operation is O(1), and is only available when [`CacheConfig::EPOCHS`] is `true`.
+    #[inline]
+    pub fn clear(&self) {
+        const { assert!(C::EPOCHS, "can only .clear() when C::EPOCHS is true") }
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Returns the hash builder used by this cache.
@@ -192,7 +235,7 @@ where
     }
 }
 
-impl<K, V, S> Cache<K, V, S>
+impl<K, V, S, C: CacheConfig> Cache<K, V, S, C>
 where
     K: Hash + Eq,
     V: Clone,
@@ -381,6 +424,9 @@ where
         if Self::NEEDS_DROP {
             tag |= ALIVE_BIT;
         }
+        if C::EPOCHS {
+            tag = (tag & !EPOCH_MASK) | ((self.epoch() << EPOCH_SHIFT) & EPOCH_MASK);
+        }
         (bucket, tag)
     }
 
@@ -396,7 +442,7 @@ where
     }
 }
 
-impl<K, V, S> Drop for Cache<K, V, S> {
+impl<K, V, S, C: CacheConfig> Drop for Cache<K, V, S, C> {
     fn drop(&mut self) {
         if self.drop {
             // SAFETY: `Drop` has exclusive access.
@@ -518,6 +564,12 @@ mod tests {
 
     type BH = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
     type Cache<K, V> = super::Cache<K, V, BH>;
+
+    struct EpochConfig;
+    impl CacheConfig for EpochConfig {
+        const EPOCHS: bool = true;
+    }
+    type EpochCache<K, V> = super::Cache<K, V, BH, EpochConfig>;
 
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
@@ -971,5 +1023,42 @@ mod tests {
         }
         // Cache dropped: new key + new value = 2 more
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn epoch_clear() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(1024, Default::default());
+
+        assert_eq!(cache.epoch(), 0);
+
+        cache.insert(1, 100);
+        cache.insert(2, 200);
+        assert_eq!(cache.get(&1), Some(100));
+        assert_eq!(cache.get(&2), Some(200));
+
+        cache.clear();
+        assert_eq!(cache.epoch(), 1);
+
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), None);
+
+        cache.insert(1, 101);
+        assert_eq!(cache.get(&1), Some(101));
+
+        cache.clear();
+        assert_eq!(cache.epoch(), 2);
+        assert_eq!(cache.get(&1), None);
+    }
+
+    #[test]
+    fn epoch_wrap_around() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(1024, Default::default());
+
+        for _ in 0..300 {
+            cache.insert(42, 123);
+            assert_eq!(cache.get(&42), Some(123));
+            cache.clear();
+            assert_eq!(cache.get(&42), None);
+        }
     }
 }
