@@ -23,7 +23,7 @@ const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
 const NEEDED_BITS: usize = 2;
 
-const EPOCH_BITS: usize = 8;
+const EPOCH_BITS: usize = 10;
 const EPOCH_SHIFT: usize = NEEDED_BITS;
 const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
 const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
@@ -116,11 +116,14 @@ impl<K, V, S, C: CacheConfig> fmt::Debug for Cache<K, V, S, C> {
 unsafe impl<K: Send, V: Send, S: Send, C: CacheConfig + Send> Send for Cache<K, V, S, C> {}
 unsafe impl<K: Send, V: Send, S: Sync, C: CacheConfig + Sync> Sync for Cache<K, V, S, C> {}
 
-impl<K, V, S, C: CacheConfig> Cache<K, V, S, C>
+impl<K, V, S, C> Cache<K, V, S, C>
 where
     K: Hash + Eq,
     S: BuildHasher,
+    C: CacheConfig,
 {
+    const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+
     /// Create a new cache with the specified number of entries and hasher.
     ///
     /// Dynamically allocates memory for the cache entries.
@@ -209,11 +212,41 @@ where
 
     /// Clears the cache by invalidating all entries.
     ///
-    /// This operation is O(1), and is only available when [`CacheConfig::EPOCHS`] is `true`.
+    /// This is O(1): it simply increments an epoch counter. On epoch wraparound, falls back to
+    /// [`clear_slow`](Self::clear_slow).
+    ///
+    /// Can only be called when [`CacheConfig::EPOCHS`] is `true`.
     #[inline]
     pub fn clear(&self) {
+        const EPOCH_MAX: usize = (1 << EPOCH_BITS) - 1;
         const { assert!(C::EPOCHS, "can only .clear() when C::EPOCHS is true") }
-        self.epoch.fetch_add(1, Ordering::Release);
+        let prev = self.epoch.fetch_add(1, Ordering::Release);
+        if prev == EPOCH_MAX {
+            self.clear_slow();
+        }
+    }
+
+    /// Clears the cache by zeroing all bucket memory.
+    ///
+    /// This is O(N) where N is the number of buckets. Prefer [`clear`](Self::clear) when
+    /// [`CacheConfig::EPOCHS`] is `true`.
+    ///
+    /// # Safety
+    ///
+    /// This method is safe but may race with concurrent operations. Callers should ensure
+    /// no other threads are accessing the cache during this operation.
+    pub fn clear_slow(&self) {
+        // SAFETY: We zero the entire bucket array. This is safe because:
+        // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
+        // - We don't need to drop existing entries since we're zeroing the ALIVE_BIT.
+        // - Concurrent readers will see either the old state or zeros (empty).
+        unsafe {
+            std::ptr::write_bytes(
+                self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
+                0,
+                self.entries.len(),
+            )
+        };
     }
 
     /// Returns the hash builder used by this cache.
@@ -235,14 +268,13 @@ where
     }
 }
 
-impl<K, V, S, C: CacheConfig> Cache<K, V, S, C>
+impl<K, V, S, C> Cache<K, V, S, C>
 where
     K: Hash + Eq,
     V: Clone,
     S: BuildHasher,
+    C: CacheConfig,
 {
-    const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-
     /// Get an entry from the cache.
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
@@ -1027,7 +1059,7 @@ mod tests {
 
     #[test]
     fn epoch_clear() {
-        let cache: EpochCache<u64, u64> = EpochCache::new(1024, Default::default());
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
 
         assert_eq!(cache.epoch(), 0);
 
@@ -1052,13 +1084,26 @@ mod tests {
 
     #[test]
     fn epoch_wrap_around() {
-        let cache: EpochCache<u64, u64> = EpochCache::new(1024, Default::default());
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
 
         for _ in 0..300 {
             cache.insert(42, 123);
             assert_eq!(cache.get(&42), Some(123));
             cache.clear();
             assert_eq!(cache.get(&42), None);
+        }
+    }
+
+    #[test]
+    fn epoch_wraparound_stays_cleared() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+
+        cache.insert(42, 123);
+        assert_eq!(cache.get(&42), Some(123));
+
+        for i in 0..2048 {
+            cache.clear();
+            assert_eq!(cache.get(&42), None, "failed at clear #{i}");
         }
     }
 }
