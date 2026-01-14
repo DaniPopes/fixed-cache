@@ -136,8 +136,12 @@ where
     // See len_assertion for why.
     pub fn new(num: usize, build_hasher: S) -> Self {
         Self::len_assertion(num);
-        let entries =
-            Box::into_raw((0..num).map(|_| Bucket::new()).collect::<Vec<_>>().into_boxed_slice());
+        let layout = std::alloc::Layout::array::<Bucket<(K, V)>>(num).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let entries = std::ptr::slice_from_raw_parts(ptr.cast::<Bucket<(K, V)>>(), num);
         Self::new_inner(entries, build_hasher, true)
     }
 
