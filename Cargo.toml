@@ -1,6 +1,6 @@
 [package]
 name = "fixed-cache"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A minimalistic, lock-free, fixed-size cache"
 rust-version = "1.88" # MSRV
