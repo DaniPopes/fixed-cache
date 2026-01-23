@@ -82,6 +82,13 @@ pub trait StatsHandler<K, V>: Send + Sync {
         let _ = key;
     }
 
+    #[deprecated(note = "use on_insert and check that evicted key doesn't equal to new key")]
+    fn on_collision(&self, new_key: AnyRef<'_>, existing_key: &K, existing_value: &V) {
+        let _ = new_key;
+        let _ = existing_key;
+        let _ = existing_value;
+    }
+
     /// Called when a key is inserted.
     ///
     /// If this evicted an existing key (either the same, or a different due to a collision),
