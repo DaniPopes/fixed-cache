@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_with_stats_collisions_on_get() {
+    fn cache_with_stats_no_collision_on_get_miss() {
         use std::hash::{Hash, Hasher};
 
         #[derive(Clone, Eq, PartialEq)]
@@ -279,9 +279,41 @@ mod tests {
             Cache::new(64, Default::default()).with_stats(Some(stats));
 
         cache.insert(CollidingKey(1, 1), 100);
+        // Getting a different key that hashes to the same bucket should NOT record a collision
+        // (collisions are only recorded on insert, not on get misses)
         let result = cache.get(&CollidingKey(1, 2));
         assert!(result.is_none());
+        assert_eq!(handler.collisions(), 0);
+        assert_eq!(handler.misses(), 1);
+    }
 
+    #[test]
+    fn cache_with_stats_collisions_on_insert() {
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Clone, Eq, PartialEq)]
+        struct CollidingKey(u64, u64);
+
+        impl Hash for CollidingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        let handler = Arc::new(CountingStatsHandler::new());
+        let stats = Stats::new(Arc::clone(&handler));
+        let cache: Cache<CollidingKey, u64, BH> =
+            Cache::new(64, Default::default()).with_stats(Some(stats));
+
+        cache.insert(CollidingKey(1, 1), 100);
+        assert_eq!(handler.collisions(), 0);
+
+        // Inserting a different key that hashes to the same bucket should record a collision
+        cache.insert(CollidingKey(1, 2), 200);
+        assert_eq!(handler.collisions(), 1);
+
+        // Inserting the same key again should NOT record a collision (it's an update)
+        cache.insert(CollidingKey(1, 2), 300);
         assert_eq!(handler.collisions(), 1);
     }
 

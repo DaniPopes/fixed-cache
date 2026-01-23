@@ -304,10 +304,6 @@ where
                 bucket.unlock(tag);
                 return Some(v);
             }
-            #[cfg(feature = "stats")]
-            if let Some(stats) = &self.stats {
-                stats.record_collision(AnyRef::new(&key), ck, v);
-            }
             bucket.unlock(tag);
         }
         #[cfg(feature = "stats")]
@@ -357,13 +353,42 @@ where
         if let Some(prev_tag) = bucket.try_lock_ret(None) {
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
+                // Check if bucket had data (any bits besides LOCKED_BIT means it was written to)
+                let is_alive = (prev_tag & !LOCKED_BIT) != 0;
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
-                // Drop old value if bucket was alive.
-                if Self::NEEDS_DROP && (prev_tag & ALIVE_BIT) != 0 {
-                    std::ptr::drop_in_place(data);
+
+                #[cfg(feature = "stats")]
+                {
+                    if is_alive {
+                        // Replace key/value and get the old ones for collision recording and
+                        // dropping
+                        let old_key = std::ptr::replace(&raw mut (*data).0, make_key());
+                        let old_value = std::ptr::replace(&raw mut (*data).1, make_value());
+                        if let Some(stats) = &self.stats
+                            && !old_key.equivalent(&(*data).0)
+                        {
+                            stats.record_collision(AnyRef::new(&(*data).0), &old_key, &old_value);
+                        }
+
+                        if Self::NEEDS_DROP {
+                            drop(old_key);
+                            drop(old_value);
+                        }
+                    } else {
+                        (&raw mut (*data).0).write(make_key());
+                        (&raw mut (*data).1).write(make_value());
+                    }
                 }
-                (&raw mut (*data).0).write(make_key());
-                (&raw mut (*data).1).write(make_value());
+
+                #[cfg(not(feature = "stats"))]
+                {
+                    // Drop old value if bucket was alive.
+                    if Self::NEEDS_DROP && is_alive {
+                        std::ptr::drop_in_place(data);
+                    }
+                    (&raw mut (*data).0).write(make_key());
+                    (&raw mut (*data).1).write(make_value());
+                }
             }
             bucket.unlock(tag);
         }
