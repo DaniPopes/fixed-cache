@@ -330,6 +330,10 @@ where
             let (ck, v) = unsafe { data.assume_init_ref() };
             if key.equivalent(ck) {
                 let v = v.clone();
+                #[cfg(feature = "stats")]
+                if let Some(stats) = &self.stats {
+                    stats.record_remove(ck, &v);
+                }
                 if Self::NEEDS_DROP {
                     // SAFETY: We hold the lock, so we have exclusive access.
                     unsafe { data.assume_init_drop() };
@@ -360,18 +364,22 @@ where
                 #[cfg(feature = "stats")]
                 {
                     if is_alive {
-                        // Replace key/value and get the old ones for collision recording and
-                        // dropping
+                        // Replace key/value and get the old ones for stats and dropping
                         let old_key = std::ptr::replace(&raw mut (*data).0, make_key());
                         let old_value = std::ptr::replace(&raw mut (*data).1, make_value());
-                        if let Some(stats) = &self.stats
-                            && !old_key.equivalent(&(*data).0)
-                        {
-                            stats.record_collision(AnyRef::new(&(*data).0), &old_key, &old_value);
+                        if let Some(stats) = &self.stats {
+                            stats.record_insert(
+                                &(*data).0,
+                                &(*data).1,
+                                Some((&old_key, &old_value)),
+                            );
                         }
                     } else {
                         (&raw mut (*data).0).write(make_key());
                         (&raw mut (*data).1).write(make_value());
+                        if let Some(stats) = &self.stats {
+                            stats.record_insert(&(*data).0, &(*data).1, None);
+                        }
                     }
                 }
 

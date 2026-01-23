@@ -82,32 +82,48 @@ pub trait StatsHandler<K, V>: Send + Sync {
         let _ = key;
     }
 
-    /// Called when a collision occurs (same bucket, different key - entry will be evicted).
+    /// Called when a key is inserted.
     ///
-    /// Note that `on_miss` is also called after a collision.
-    ///
-    /// The `key` parameter is a type-erased reference to the lookup key (`Q`), which may be a
-    /// different type than `K`.
-    fn on_collision(&self, new_key: AnyRef<'_>, existing_key: &K, existing_value: &V) {
-        let _ = new_key;
-        let _ = existing_key;
-        let _ = existing_value;
+    /// If this evicted an existing key (either the same, or a different due to a collision),
+    /// `evicted` contains the evicted key and value. You can check for a collision by comparing the
+    /// evicted key against the new key.
+    fn on_insert(&self, key: &K, value: &V, evicted: Option<(&K, &V)>) {
+        let _ = key;
+        let _ = value;
+        let _ = evicted;
+    }
+
+    /// Called when a key is removed from the cache.
+    fn on_remove(&self, key: &K, value: &V) {
+        let _ = key;
+        let _ = value;
     }
 }
 
 /// Default statistics handler that tracks counts using atomic integers.
 ///
-/// This is a simple implementation that just counts the number of hits, misses, and collisions.
+/// This is a simple implementation that counts hits, misses, inserts, updates, removes, and
+/// collisions.
 pub struct CountingStatsHandler {
     hits: AtomicU64,
     misses: AtomicU64,
+    inserts: AtomicU64,
+    updates: AtomicU64,
+    removes: AtomicU64,
     collisions: AtomicU64,
 }
 
 impl CountingStatsHandler {
     /// Creates a new counting stats handler with all counters initialized to zero.
     pub const fn new() -> Self {
-        Self { hits: AtomicU64::new(0), misses: AtomicU64::new(0), collisions: AtomicU64::new(0) }
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            updates: AtomicU64::new(0),
+            removes: AtomicU64::new(0),
+            collisions: AtomicU64::new(0),
+        }
     }
 
     /// Returns the number of cache hits.
@@ -120,7 +136,22 @@ impl CountingStatsHandler {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of collisions.
+    /// Returns the number of new key insertions.
+    pub fn inserts(&self) -> u64 {
+        self.inserts.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of value updates (same key, new value).
+    pub fn updates(&self) -> u64 {
+        self.updates.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of key removals.
+    pub fn removes(&self) -> u64 {
+        self.removes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of collisions (different key evicted).
     pub fn collisions(&self) -> u64 {
         self.collisions.load(Ordering::Relaxed)
     }
@@ -129,6 +160,9 @@ impl CountingStatsHandler {
     pub fn reset(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+        self.inserts.store(0, Ordering::Relaxed);
+        self.updates.store(0, Ordering::Relaxed);
+        self.removes.store(0, Ordering::Relaxed);
         self.collisions.store(0, Ordering::Relaxed);
     }
 }
@@ -148,8 +182,16 @@ impl<K, V> StatsHandler<K, V> for CountingStatsHandler {
         self.misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_collision(&self, _new_key: AnyRef<'_>, _existing_key: &K, _existing_value: &V) {
-        self.collisions.fetch_add(1, Ordering::Relaxed);
+    fn on_insert(&self, key: &K, _value: &V, evicted: Option<(&K, &V)>) {
+        match evicted {
+            Some((old_key, _)) if old_key == key => self.updates.fetch_add(1, Ordering::Relaxed),
+            Some(_) => self.collisions.fetch_add(1, Ordering::Relaxed),
+            None => self.inserts.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn on_remove(&self, _key: &K, _value: &V) {
+        self.removes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -165,8 +207,14 @@ impl<K, V, T: StatsHandler<K, V>> StatsHandler<K, V> for Arc<T> {
     }
 
     #[inline]
-    fn on_collision(&self, new_key: AnyRef<'_>, existing_key: &K, existing_value: &V) {
-        (**self).on_collision(new_key, existing_key, existing_value);
+    fn on_insert(&self, key: &K, value: &V, evicted: Option<(&K, &V)>) {
+        (**self).on_insert(key, value, evicted);
+    }
+
+    #[inline]
+    #[inline]
+    fn on_remove(&self, key: &K, value: &V) {
+        (**self).on_remove(key, value);
     }
 }
 
@@ -201,13 +249,13 @@ impl<K, V> Stats<K, V> {
     }
 
     #[inline]
-    pub(crate) fn record_collision(
-        &self,
-        new_key: AnyRef<'_>,
-        existing_key: &K,
-        existing_value: &V,
-    ) {
-        self.handler.on_collision(new_key, existing_key, existing_value);
+    pub(crate) fn record_insert(&self, key: &K, value: &V, evicted: Option<(&K, &V)>) {
+        self.handler.on_insert(key, value, evicted);
+    }
+
+    #[inline]
+    pub(crate) fn record_remove(&self, key: &K, value: &V) {
+        self.handler.on_remove(key, value);
     }
 }
 
@@ -224,6 +272,9 @@ mod tests {
         let handler = CountingStatsHandler::new();
         assert_eq!(handler.hits(), 0);
         assert_eq!(handler.misses(), 0);
+        assert_eq!(handler.inserts(), 0);
+        assert_eq!(handler.updates(), 0);
+        assert_eq!(handler.removes(), 0);
         assert_eq!(handler.collisions(), 0);
 
         StatsHandler::<u64, u64>::on_hit(&handler, &1, &2);
@@ -232,12 +283,26 @@ mod tests {
         StatsHandler::<u64, u64>::on_miss(&handler, AnyRef::new(&1u64));
         assert_eq!(handler.misses(), 1);
 
-        StatsHandler::<u64, u64>::on_collision(&handler, AnyRef::new(&1u64), &1, &2);
+        StatsHandler::<u64, u64>::on_insert(&handler, &1, &2, None);
+        assert_eq!(handler.inserts(), 1);
+        assert_eq!(handler.collisions(), 0);
+
+        StatsHandler::<u64, u64>::on_insert(&handler, &3, &4, Some((&5, &6)));
+        assert_eq!(handler.inserts(), 2);
         assert_eq!(handler.collisions(), 1);
+
+        StatsHandler::<u64, u64>::on_update(&handler, &1, &2, &3);
+        assert_eq!(handler.updates(), 1);
+
+        StatsHandler::<u64, u64>::on_remove(&handler, &1, &2);
+        assert_eq!(handler.removes(), 1);
 
         handler.reset();
         assert_eq!(handler.hits(), 0);
         assert_eq!(handler.misses(), 0);
+        assert_eq!(handler.inserts(), 0);
+        assert_eq!(handler.updates(), 0);
+        assert_eq!(handler.removes(), 0);
         assert_eq!(handler.collisions(), 0);
     }
 
@@ -388,5 +453,51 @@ mod tests {
         assert_eq!(cache.get(&"foo".to_string()), None);
 
         assert_eq!(*handler.missed_keys.lock().unwrap(), vec!["hello", "world", "foo"]);
+    }
+
+    #[test]
+    fn insert_update_collision_stats() {
+        use std::hash::{Hash, Hasher};
+
+        #[derive(Clone, Eq, PartialEq, Debug)]
+        struct CollidingKey(u64, u64);
+
+        impl Hash for CollidingKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        let handler = Arc::new(CountingStatsHandler::new());
+        let stats = Stats::new(Arc::clone(&handler));
+        let cache: Cache<CollidingKey, u64, BH> =
+            Cache::new(64, Default::default()).with_stats(Some(stats));
+
+        // First insert: should trigger on_insert only
+        cache.insert(CollidingKey(1, 1), 100);
+        assert_eq!(handler.inserts(), 1);
+        assert_eq!(handler.updates(), 0);
+        assert_eq!(handler.collisions(), 0);
+
+        // Update same key: should trigger on_update only
+        cache.insert(CollidingKey(1, 1), 200);
+        assert_eq!(handler.inserts(), 1);
+        assert_eq!(handler.updates(), 1);
+        assert_eq!(handler.collisions(), 0);
+
+        // Collision (different key, same hash): should trigger on_insert and on_collision
+        cache.insert(CollidingKey(1, 2), 300);
+        assert_eq!(handler.inserts(), 2);
+        assert_eq!(handler.updates(), 1);
+        assert_eq!(handler.collisions(), 1);
+
+        // Remove: should trigger on_remove
+        assert_eq!(handler.removes(), 0);
+        cache.remove(&CollidingKey(1, 2));
+        assert_eq!(handler.removes(), 1);
+
+        // Remove non-existent key: should not trigger on_remove
+        cache.remove(&CollidingKey(99, 99));
+        assert_eq!(handler.removes(), 1);
     }
 }
