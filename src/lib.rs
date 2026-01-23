@@ -369,11 +369,6 @@ where
                         {
                             stats.record_collision(AnyRef::new(&(*data).0), &old_key, &old_value);
                         }
-
-                        if Self::NEEDS_DROP {
-                            drop(old_key);
-                            drop(old_value);
-                        }
                     } else {
                         (&raw mut (*data).0).write(make_key());
                         (&raw mut (*data).1).write(make_value());
