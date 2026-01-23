@@ -240,17 +240,33 @@ where
     /// This method is safe but may race with concurrent operations. Callers should ensure
     /// no other threads are accessing the cache during this operation.
     pub fn clear_slow(&self) {
-        // SAFETY: We zero the entire bucket array. This is safe because:
-        // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
-        // - We don't need to drop existing entries since we're zeroing the ALIVE_BIT.
-        // - Concurrent readers will see either the old state or zeros (empty).
-        unsafe {
-            std::ptr::write_bytes(
-                self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
-                0,
-                self.entries.len(),
-            )
-        };
+        if Self::NEEDS_DROP {
+            // SAFETY: We iterate through all buckets and drop their contents if alive.
+            // Concurrent operations may race, but each bucket is individually locked.
+            for bucket in unsafe { &*self.entries } {
+                if let Some(prev_tag) = bucket.try_lock_ret(None) {
+                    if prev_tag & ALIVE_BIT != 0 {
+                        // SAFETY: We hold the lock and bucket is alive, so we have exclusive
+                        // access.
+                        unsafe { (*bucket.data.get()).assume_init_drop() };
+                    }
+                    bucket.unlock(0);
+                }
+            }
+            self.epoch.store(0, Ordering::Release);
+        } else {
+            // SAFETY: We zero the entire bucket array. This is safe because:
+            // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
+            // - We don't need to drop existing entries because !Self::NEEDS_DROP
+            // - Concurrent readers will see either the old state or zeros (empty).
+            unsafe {
+                std::ptr::write_bytes(
+                    self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
+                    0,
+                    self.entries.len(),
+                )
+            }
+        }
     }
 
     /// Returns the hash builder used by this cache.
@@ -1129,5 +1145,133 @@ mod tests {
             cache.clear();
             assert_eq!(cache.get(&42), None, "failed at clear #{i}");
         }
+    }
+
+    #[test]
+    fn clear_slow_drops_entries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            cache.insert(DropKey(2), DropValue(200));
+            cache.insert(DropKey(3), DropValue(300));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+
+            cache.clear_slow();
+            // 3 keys + 3 values = 6 drops
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 6);
+        }
+        // Cache dropped, but buckets already cleared - no additional drops
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn clear_slow_no_double_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+
+            // Multiple clear_slow calls should not cause double-drop
+            cache.clear_slow();
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2); // 1 key + 1 value
+
+            cache.clear_slow();
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2); // No additional drops
+
+            cache.clear_slow();
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2); // Still no additional drops
+        }
+        // Cache dropped - no additional drops since already cleared
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn epoch_clear_drops_on_wraparound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        type EpochCacheDrop<K, V> = super::Cache<K, V, BH, EpochConfig>;
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: EpochCacheDrop<DropKey, DropValue> =
+                EpochCacheDrop::new(4096, Default::default());
+
+            cache.insert(DropKey(1), DropValue(100));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+
+            // Fast path clears (epoch increment) don't drop - entries just become stale
+            for _ in 0..1023 {
+                cache.clear();
+            }
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+
+            // On epoch wraparound (1024th clear, when prev==EPOCH_MAX), clear_slow is called
+            cache.clear();
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2); // 1 key + 1 value
+        }
+        // Cache dropped - no additional drops since already cleared
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
     }
 }
