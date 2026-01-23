@@ -173,7 +173,7 @@ impl Default for CountingStatsHandler {
     }
 }
 
-impl<K, V> StatsHandler<K, V> for CountingStatsHandler {
+impl<K: PartialEq, V> StatsHandler<K, V> for CountingStatsHandler {
     fn on_hit(&self, _key: &K, _value: &V) {
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -184,10 +184,17 @@ impl<K, V> StatsHandler<K, V> for CountingStatsHandler {
 
     fn on_insert(&self, key: &K, _value: &V, evicted: Option<(&K, &V)>) {
         match evicted {
-            Some((old_key, _)) if old_key == key => self.updates.fetch_add(1, Ordering::Relaxed),
-            Some(_) => self.collisions.fetch_add(1, Ordering::Relaxed),
-            None => self.inserts.fetch_add(1, Ordering::Relaxed),
-        };
+            Some((old_key, _)) if old_key == key => {
+                self.updates.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(_) => {
+                self.inserts.fetch_add(1, Ordering::Relaxed);
+                self.collisions.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                self.inserts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn on_remove(&self, _key: &K, _value: &V) {
@@ -211,7 +218,6 @@ impl<K, V, T: StatsHandler<K, V>> StatsHandler<K, V> for Arc<T> {
         (**self).on_insert(key, value, evicted);
     }
 
-    #[inline]
     #[inline]
     fn on_remove(&self, key: &K, value: &V) {
         (**self).on_remove(key, value);
@@ -291,7 +297,7 @@ mod tests {
         assert_eq!(handler.inserts(), 2);
         assert_eq!(handler.collisions(), 1);
 
-        StatsHandler::<u64, u64>::on_update(&handler, &1, &2, &3);
+        StatsHandler::<u64, u64>::on_insert(&handler, &1, &2, Some((&1, &3)));
         assert_eq!(handler.updates(), 1);
 
         StatsHandler::<u64, u64>::on_remove(&handler, &1, &2);
