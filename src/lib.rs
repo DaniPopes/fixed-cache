@@ -320,18 +320,15 @@ where
             // will detect it (the writer changes the tag under its lock/unlock cycle).
             let seq1 = bucket.tag.load(Ordering::Acquire);
             if seq1 == tag {
-                let copy = unsafe { std::ptr::read(bucket.data.get()) };
-                if seq1 == bucket.tag.load(Ordering::Acquire) {
-                    let (ck, v) = unsafe { copy.assume_init() };
-                    if key.equivalent(&ck) {
-                        #[cfg(feature = "stats")]
-                        if C::STATS
-                            && let Some(stats) = &self.stats
-                        {
-                            stats.record_hit(&ck, &v);
-                        }
-                        return Some(v);
+                let (ck, v) = unsafe { std::ptr::read(bucket.data.get().cast::<(K, V)>()) };
+                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
+                    #[cfg(feature = "stats")]
+                    if C::STATS
+                        && let Some(stats) = &self.stats
+                    {
+                        stats.record_hit(&ck, &v);
                     }
+                    return Some(v);
                 }
             }
         } else if bucket.try_lock(Some(tag)) {
@@ -362,7 +359,7 @@ where
     /// Insert an entry into the cache.
     pub fn insert(&self, key: K, value: V) {
         let (bucket, tag) = self.calc(&key);
-        self.insert_inner(|| key, || value, bucket, tag);
+        self.insert_inner(bucket, tag, || (key, value));
     }
 
     /// Remove an entry from the cache.
@@ -397,11 +394,25 @@ where
     #[inline]
     fn insert_inner(
         &self,
-        make_key: impl FnOnce() -> K,
-        make_value: impl FnOnce() -> V,
         bucket: &Bucket<(K, V)>,
         tag: usize,
+        make_entry: impl FnOnce() -> (K, V),
     ) {
+        #[inline(always)]
+        unsafe fn do_write<T>(ptr: *mut T, f: impl FnOnce() -> T) {
+            // This function is translated as:
+            // - allocate space for a T on the stack
+            // - call f() with the return value being put onto this stack space
+            // - memcpy from the stack to the heap
+            //
+            // Ideally we want LLVM to always realize that doing a stack
+            // allocation is unnecessary and optimize the code so it writes
+            // directly into the heap instead. It seems we get it to realize
+            // this most consistently if we put this critical line into it's
+            // own function instead of inlining it into the surrounding code.
+            unsafe { core::ptr::write(ptr, f()) };
+        }
+
         if let Some(prev_tag) = bucket.try_lock_ret(None) {
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
@@ -409,12 +420,11 @@ where
                 let is_alive = (prev_tag & !LOCKED_BIT) != 0;
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
 
-                #[cfg(feature = "stats")]
-                if C::STATS {
+                if C::STATS && cfg!(feature = "stats") {
+                    #[cfg(feature = "stats")]
                     if is_alive {
                         // Replace key/value and get the old ones for stats and dropping
-                        let old_key = std::ptr::replace(&raw mut (*data).0, make_key());
-                        let old_value = std::ptr::replace(&raw mut (*data).1, make_value());
+                        let (old_key, old_value) = std::ptr::replace(data, make_entry());
                         if let Some(stats) = &self.stats {
                             stats.record_insert(
                                 &(*data).0,
@@ -423,8 +433,7 @@ where
                             );
                         }
                     } else {
-                        (&raw mut (*data).0).write(make_key());
-                        (&raw mut (*data).1).write(make_value());
+                        do_write(data, make_entry);
                         if let Some(stats) = &self.stats {
                             stats.record_insert(&(*data).0, &(*data).1, None);
                         }
@@ -433,18 +442,7 @@ where
                     if Self::NEEDS_DROP && is_alive {
                         std::ptr::drop_in_place(data);
                     }
-                    (&raw mut (*data).0).write(make_key());
-                    (&raw mut (*data).1).write(make_value());
-                }
-
-                #[cfg(not(feature = "stats"))]
-                {
-                    // Drop old value if bucket was alive.
-                    if Self::NEEDS_DROP && is_alive {
-                        std::ptr::drop_in_place(data);
-                    }
-                    (&raw mut (*data).0).write(make_key());
-                    (&raw mut (*data).1).write(make_value());
+                    do_write(data, make_entry);
                 }
             }
             bucket.unlock(tag);
@@ -531,7 +529,7 @@ where
             return Ok(v);
         }
         let value = f(key)?;
-        self.insert_inner(|| cvt(key), || value.clone(), bucket, tag);
+        self.insert_inner(bucket, tag, || (cvt(key), value.clone()));
         Ok(value)
     }
 
