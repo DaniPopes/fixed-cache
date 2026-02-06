@@ -952,6 +952,32 @@ mod tests {
     }
 
     #[test]
+    fn seqlock_aba() {
+        if cfg!(miri) {
+            return;
+        }
+
+        const VALUE_N: usize = 16;
+
+        let cache: Cache<u64, [u64; VALUE_N]> = new_cache(1024);
+        let n = iters(500_000);
+
+        run_concurrent(4, |t| {
+            if t == 0 {
+                for i in 0..n as u64 {
+                    cache.insert(1, [i; VALUE_N]);
+                }
+            } else {
+                for _ in 0..n {
+                    if let Some(v) = cache.get(&1) {
+                        assert!(v.windows(2).all(|w| w[0] == w[1]), "torn read: {v:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn concurrent_get_or_insert() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
