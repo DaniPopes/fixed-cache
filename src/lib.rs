@@ -307,7 +307,34 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if bucket.try_lock(Some(tag)) {
+        if !Self::NEEDS_DROP {
+            // Lock-free speculative read for types without destructors.
+            //
+            // 1. Load tag (Acquire — orders subsequent reads after this).
+            // 2. Speculatively read data via ptr::read (no lock held).
+            // 3. Re-load tag — if unchanged, no writer was active during our window.
+            // 4. Validate key and return.
+            //
+            // SAFETY: `!NEEDS_DROP` guarantees no destructors, so a speculative read cannot
+            // cause use-after-free. If a concurrent write produces a torn read, the tag re-check
+            // will detect it (the writer changes the tag under its lock/unlock cycle).
+            let seq1 = bucket.tag.load(Ordering::Acquire);
+            if seq1 == tag {
+                let copy = unsafe { std::ptr::read(bucket.data.get()) };
+                if seq1 == bucket.tag.load(Ordering::Acquire) {
+                    let (ck, v) = unsafe { copy.assume_init() };
+                    if key.equivalent(&ck) {
+                        #[cfg(feature = "stats")]
+                        if C::STATS
+                            && let Some(stats) = &self.stats
+                        {
+                            stats.record_hit(&ck, &v);
+                        }
+                        return Some(v);
+                    }
+                }
+            }
+        } else if bucket.try_lock(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -433,7 +460,8 @@ where
     where
         F: FnOnce(&K) -> V,
     {
-        self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key))).unwrap()
+        let Ok(v) = self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key)));
+        v
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -452,7 +480,8 @@ where
         F: FnOnce(&'a Q) -> V,
         Cvt: FnOnce(&'a Q) -> K,
     {
-        self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt).unwrap()
+        let Ok(v) = self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt);
+        v
     }
 
     /// Gets a value from the cache, or attempts to insert one computed by `f` if not present.
