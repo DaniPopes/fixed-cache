@@ -37,6 +37,16 @@ type DefaultBuildHasher = std::hash::RandomState;
 ///
 /// This trait allows customizing cache behavior through compile-time configuration.
 pub trait CacheConfig {
+    /// Whether to track statistics for cache performance.
+    ///
+    /// When enabled, the cache tracks hit and miss counts for each key, allowing
+    /// monitoring of cache performance.
+    ///
+    /// Only enabled when the `stats` feature is also enabled.
+    ///
+    /// Defaults to `true`.
+    const STATS: bool = true;
+
     /// Whether to track epochs for cheap invalidation via [`Cache::clear`].
     ///
     /// When enabled, the cache tracks an epoch counter that is incremented on each call to
@@ -157,6 +167,8 @@ where
     }
 
     /// Sets the cache's statistics.
+    ///
+    /// Can only be called when [`CacheConfig::STATS`] is `true`.
     #[cfg(feature = "stats")]
     #[inline]
     pub fn with_stats(mut self, stats: Option<Stats<K, V>>) -> Self {
@@ -165,9 +177,12 @@ where
     }
 
     /// Sets the cache's statistics.
+    ///
+    /// Can only be called when [`CacheConfig::STATS`] is `true`.
     #[cfg(feature = "stats")]
     #[inline]
     pub fn set_stats(&mut self, stats: Option<Stats<K, V>>) {
+        const { assert!(C::STATS, "can only set stats when C::STATS is true") }
         self.stats = stats;
     }
 
@@ -297,7 +312,9 @@ where
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
                 #[cfg(feature = "stats")]
-                if let Some(stats) = &self.stats {
+                if C::STATS
+                    && let Some(stats) = &self.stats
+                {
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
@@ -307,7 +324,9 @@ where
             bucket.unlock(tag);
         }
         #[cfg(feature = "stats")]
-        if let Some(stats) = &self.stats {
+        if C::STATS
+            && let Some(stats) = &self.stats
+        {
             stats.record_miss(AnyRef::new(&key));
         }
         None
@@ -331,7 +350,9 @@ where
             if key.equivalent(ck) {
                 let v = v.clone();
                 #[cfg(feature = "stats")]
-                if let Some(stats) = &self.stats {
+                if C::STATS
+                    && let Some(stats) = &self.stats
+                {
                     stats.record_remove(ck, &v);
                 }
                 if Self::NEEDS_DROP {
@@ -362,7 +383,7 @@ where
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
 
                 #[cfg(feature = "stats")]
-                {
+                if C::STATS {
                     if is_alive {
                         // Replace key/value and get the old ones for stats and dropping
                         let old_key = std::ptr::replace(&raw mut (*data).0, make_key());
@@ -381,6 +402,12 @@ where
                             stats.record_insert(&(*data).0, &(*data).1, None);
                         }
                     }
+                } else {
+                    if Self::NEEDS_DROP && is_alive {
+                        std::ptr::drop_in_place(data);
+                    }
+                    (&raw mut (*data).0).write(make_key());
+                    (&raw mut (*data).1).write(make_value());
                 }
 
                 #[cfg(not(feature = "stats"))]
@@ -634,6 +661,12 @@ mod tests {
         const EPOCHS: bool = true;
     }
     type EpochCache<K, V> = super::Cache<K, V, BH, EpochConfig>;
+
+    struct NoStatsConfig;
+    impl CacheConfig for NoStatsConfig {
+        const STATS: bool = false;
+    }
+    type NoStatsCache<K, V> = super::Cache<K, V, BH, NoStatsConfig>;
 
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
@@ -1124,6 +1157,24 @@ mod tests {
             cache.clear();
             assert_eq!(cache.get(&42), None);
         }
+    }
+
+    #[test]
+    fn no_stats_config() {
+        let cache: NoStatsCache<u64, u64> = NoStatsCache::new(64, Default::default());
+
+        cache.insert(1, 100);
+        assert_eq!(cache.get(&1), Some(100));
+        assert_eq!(cache.get(&999), None);
+
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+
+        cache.remove(&1);
+        assert_eq!(cache.get(&1), None);
+
+        let v = cache.get_or_insert_with(42, |&k| k * 2);
+        assert_eq!(v, 84);
     }
 
     #[test]
