@@ -106,6 +106,9 @@ impl CacheConfig for DefaultCacheConfig {}
 ///
 /// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 /// - **No iteration**: Individual entries cannot be enumerated.
+/// - **`Clone + !Drop` types**: The lock-free read path uses `!needs_drop` as a proxy for `Copy`,
+///   so types that implement `Clone` with non-trivial logic but don't implement `Drop` will be
+///   bitwise-copied instead of cloned on reads. Avoid using such types as keys or values.
 ///
 /// # Type Parameters
 ///
@@ -978,6 +981,11 @@ mod tests {
 
     #[test]
     fn concurrent_read_write() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
+        if cfg!(miri) {
+            return;
+        }
+
         let cache: Cache<u64, u64> = new_cache(256);
         let n = iters(1000);
 
@@ -994,6 +1002,7 @@ mod tests {
 
     #[test]
     fn seqlock_aba() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
         if cfg!(miri) {
             return;
         }
@@ -1020,6 +1029,11 @@ mod tests {
 
     #[test]
     fn concurrent_get_or_insert() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
+        if cfg!(miri) {
+            return;
+        }
+
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -1368,6 +1382,7 @@ mod tests {
 
     #[test]
     fn epoch_concurrent_seqlock() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
         if cfg!(miri) {
             return;
         }
