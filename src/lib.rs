@@ -978,6 +978,11 @@ mod tests {
 
     #[test]
     fn concurrent_read_write() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
+        if cfg!(miri) {
+            return;
+        }
+
         let cache: Cache<u64, u64> = new_cache(256);
         let n = iters(1000);
 
@@ -994,6 +999,7 @@ mod tests {
 
     #[test]
     fn seqlock_aba() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
         if cfg!(miri) {
             return;
         }
@@ -1020,6 +1026,11 @@ mod tests {
 
     #[test]
     fn concurrent_get_or_insert() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
+        if cfg!(miri) {
+            return;
+        }
+
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -1368,6 +1379,7 @@ mod tests {
 
     #[test]
     fn epoch_concurrent_seqlock() {
+        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
         if cfg!(miri) {
             return;
         }
