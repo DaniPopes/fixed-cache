@@ -164,9 +164,7 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-
-    // TODO: Not entirely correct.
-    const ENTRY_IMPLS_COPY: bool = !Self::NEEDS_DROP;
+    const ENTRY_IMPLS_COPY: bool = Bucket::<(K, V)>::IMPLS_COPY;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -420,7 +418,11 @@ where
                     // SAFETY: We hold the lock, so we have exclusive access.
                     unsafe { data.assume_init_drop() };
                 }
-                let new_version = prev.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+                let new_version = if Self::ENTRY_IMPLS_COPY {
+                    prev.wrapping_add(VERSION_INCREMENT) & VERSION_MASK
+                } else {
+                    0
+                };
                 bucket.unlock(new_version);
                 return Some(v);
             }
@@ -619,6 +621,9 @@ pub struct Bucket<T> {
 impl<T> Bucket<T> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
 
+    // TODO: Not entirely correct.
+    const IMPLS_COPY: bool = !Self::NEEDS_DROP;
+
     /// Creates a new zeroed bucket.
     #[inline]
     pub const fn new() -> Self {
@@ -626,7 +631,11 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
-    fn try_lock_ret(&self, expected: Option<usize>, bump_version: bool) -> Option<usize> {
+    fn try_lock_ret(&self, expected: Option<usize>, mut bump_version: bool) -> Option<usize> {
+        if !Self::IMPLS_COPY {
+            bump_version = false;
+        }
+
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
             if state & !VERSION_MASK != expected {
