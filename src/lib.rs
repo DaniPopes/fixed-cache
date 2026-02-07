@@ -164,9 +164,7 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-
-    // TODO: Not entirely correct.
-    const ENTRY_IMPLS_COPY: bool = !Self::NEEDS_DROP;
+    const ENTRY_IMPLS_COPY: bool = Bucket::<(K, V)>::IMPLS_COPY;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -618,6 +616,9 @@ pub struct Bucket<T> {
 
 impl<T> Bucket<T> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
+
+    // TODO: Not entirely correct.
+    const IMPLS_COPY: bool = !Self::NEEDS_DROP;
 
     /// Creates a new zeroed bucket.
     #[inline]
