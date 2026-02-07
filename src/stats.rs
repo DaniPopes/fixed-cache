@@ -523,7 +523,8 @@ mod tests {
 
         let handler = Arc::new(CountingStatsHandler::new());
         let stats = Stats::new(Arc::clone(&handler));
-        let cache: Cache<u64, u64, BH> = Cache::new(1024, Default::default()).with_stats(Some(stats));
+        let cache: Cache<u64, u64, BH> =
+            Cache::new(1024, Default::default()).with_stats(Some(stats));
 
         std::thread::scope(|s| {
             for t in 0..4 {
@@ -531,18 +532,22 @@ mod tests {
                 s.spawn(move || {
                     for i in 0..1000u64 {
                         match t {
-                            0 => { cache.insert(i % 100, i); }
-                            1 => { let _ = cache.get(&(i % 100)); }
-                            2 => { cache.get_or_insert_with(i % 100, |&k| k * 2); }
-                            _ => { let _ = cache.remove(&(i % 100)); }
+                            0 => cache.insert(i % 100, i),
+                            1 => _ = cache.get(&(i % 100)),
+                            2 => _ = cache.get_or_insert_with(i % 100, |&k| k * 2),
+                            _ => _ = cache.remove(&(i % 100)),
                         }
                     }
                 });
             }
         });
 
-        let total = handler.hits() + handler.misses() + handler.inserts()
-            + handler.updates() + handler.removes() + handler.collisions();
+        let total = handler.hits()
+            + handler.misses()
+            + handler.inserts()
+            + handler.updates()
+            + handler.removes()
+            + handler.collisions();
         assert!(total > 0);
         assert_eq!(handler.hits() + handler.misses(), 1000 + 1000);
     }
