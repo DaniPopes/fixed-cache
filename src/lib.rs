@@ -106,6 +106,9 @@ impl CacheConfig for DefaultCacheConfig {}
 ///
 /// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 /// - **No iteration**: Individual entries cannot be enumerated.
+/// - **`Clone + !Drop` types**: The lock-free read path uses `!needs_drop` as a proxy for `Copy`,
+///   so types that implement `Clone` with non-trivial logic but don't implement `Drop` will be
+///   bitwise-copied instead of cloned on reads. Avoid using such types as keys or values.
 ///
 /// # Type Parameters
 ///
