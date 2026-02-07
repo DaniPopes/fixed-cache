@@ -138,6 +138,7 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+    const ENTRY_IMPLS_COPY: bool = impls::impls!((K, V): Copy);
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -312,7 +313,7 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if !Self::NEEDS_DROP {
+        if Self::ENTRY_IMPLS_COPY {
             let tag2 = bucket.tag.load(Ordering::Acquire);
             if (tag2 & LOCKED_BIT) == 0 && (tag2 & !VERSION_MASK) == tag {
                 let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };

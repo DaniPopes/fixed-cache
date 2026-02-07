@@ -12,6 +12,7 @@ categories = ["caching", "concurrency", "data-structures"]
 
 [dependencies]
 equivalent = "1"
+impls = "1"
 
 rapidhash = { version = "4", default-features = false, optional = true }
 typeid = { version = "1", default-features = false, optional = true }
