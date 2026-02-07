@@ -1,11 +1,9 @@
-use std::{
+use alloc::{boxed::Box, sync::Arc};
+use core::{
     any::TypeId,
     fmt,
     marker::PhantomData,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// A type-erased reference that can be downcast even for non-`'static` types.

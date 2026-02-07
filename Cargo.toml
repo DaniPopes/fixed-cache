@@ -11,7 +11,7 @@ keywords = ["fixed", "cache", "hash", "concurrent", "lock-free"]
 categories = ["caching", "concurrency", "data-structures"]
 
 [dependencies]
-equivalent = "1"
+equivalent = { version = "1", default-features = false }
 
 rapidhash = { version = "4", default-features = false, optional = true }
 typeid = { version = "1", default-features = false, optional = true }
@@ -20,7 +20,11 @@ typeid = { version = "1", default-features = false, optional = true }
 rapidhash = { version = "4", default-features = false }
 
 [features]
-default = []
+default = ["std"]
+
+std = ["alloc", "rapidhash?/std"]
+alloc = []
+
 rapidhash = ["dep:rapidhash"]
 nightly = ["rapidhash?/nightly"]
-stats = ["dep:typeid"]
+stats = ["alloc", "dep:typeid"]

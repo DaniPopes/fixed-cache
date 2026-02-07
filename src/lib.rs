@@ -1,17 +1,22 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::new_without_default)]
 
-use equivalent::Equivalent;
-use std::{
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+use core::{
     cell::UnsafeCell,
     convert::Infallible,
     fmt,
     hash::{BuildHasher, Hash},
     marker::PhantomData,
-    mem::MaybeUninit,
-    sync::atomic::{AtomicUsize, Ordering},
+    mem::{self, MaybeUninit},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
 };
+use equivalent::Equivalent;
 
 #[cfg(feature = "stats")]
 mod stats;
@@ -57,9 +62,15 @@ const VERSION_MASK: usize = ((1usize << VERSION_BITS) - 1) << VERSION_SHIFT;
 const VERSION_INCREMENT: usize = 1usize << VERSION_SHIFT;
 
 #[cfg(feature = "rapidhash")]
-type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
-#[cfg(not(feature = "rapidhash"))]
+type DefaultBuildHasher = core::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
+#[cfg(all(not(feature = "rapidhash"), feature = "std"))]
 type DefaultBuildHasher = std::hash::RandomState;
+#[cfg(all(not(feature = "rapidhash"), not(feature = "std")))]
+type DefaultBuildHasher = core::hash::BuildHasherDefault<NoDefaultHasher>;
+
+#[cfg(all(not(feature = "rapidhash"), not(feature = "std")))]
+#[doc(hidden)]
+pub enum NoDefaultHasher {}
 
 /// Configuration trait for [`Cache`].
 ///
@@ -145,6 +156,7 @@ pub struct Cache<K, V, S = DefaultBuildHasher, C: CacheConfig = DefaultCacheConf
     build_hasher: S,
     #[cfg(feature = "stats")]
     stats: Option<Stats<K, V>>,
+    #[cfg(feature = "alloc")]
     drop: bool,
     epoch: AtomicUsize,
     _config: PhantomData<C>,
@@ -179,14 +191,16 @@ where
     /// - is not a power of two.
     /// - isn't at least 4.
     // See len_assertion for why.
+    #[cfg(feature = "alloc")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
     pub fn new(num: usize, build_hasher: S) -> Self {
         Self::len_assertion(num);
-        let layout = std::alloc::Layout::array::<Bucket<(K, V)>>(num).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let layout = alloc::alloc::Layout::array::<Bucket<(K, V)>>(num).unwrap();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            alloc::alloc::handle_alloc_error(layout);
         }
-        let entries = std::ptr::slice_from_raw_parts(ptr.cast::<Bucket<(K, V)>>(), num);
+        let entries = ptr::slice_from_raw_parts(ptr.cast::<Bucket<(K, V)>>(), num);
         Self::new_inner(entries, build_hasher, true)
     }
 
@@ -223,11 +237,13 @@ where
 
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
+        let _ = drop;
         Self {
             entries,
             build_hasher,
             #[cfg(feature = "stats")]
             stats: None,
+            #[cfg(feature = "alloc")]
             drop,
             epoch: AtomicUsize::new(0),
             _config: PhantomData,
@@ -247,7 +263,7 @@ where
     #[inline]
     const fn index_mask(&self) -> usize {
         let n = self.capacity();
-        unsafe { std::hint::assert_unchecked(n.is_power_of_two()) };
+        unsafe { core::hint::assert_unchecked(n.is_power_of_two()) };
         n - 1
     }
 
@@ -295,7 +311,7 @@ where
         // - We don't need to drop existing entries since we're zeroing the ALIVE_BIT.
         // - Concurrent readers will see either the old state or zeros (empty).
         unsafe {
-            std::ptr::write_bytes(
+            ptr::write_bytes(
                 self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
                 0,
                 self.entries.len(),
@@ -356,7 +372,7 @@ where
 
                 // Skip fence on x86. Thanks to TSO, these loads are never reordered.
                 if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
-                    std::sync::atomic::fence(Ordering::Acquire);
+                    atomic::fence(Ordering::Acquire);
                 }
 
                 if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
@@ -452,7 +468,7 @@ where
             // directly into the heap instead. It seems we get it to realize
             // this most consistently if we put this critical line into it's
             // own function instead of inlining it into the surrounding code.
-            unsafe { core::ptr::write(ptr, f()) };
+            unsafe { ptr::write(ptr, f()) };
         }
 
         let Some(locked) = bucket.try_lock_ret(None, true) else {
@@ -468,7 +484,7 @@ where
             if C::STATS && cfg!(feature = "stats") {
                 #[cfg(feature = "stats")]
                 if is_alive {
-                    let (old_key, old_value) = std::ptr::replace(data, make_entry());
+                    let (old_key, old_value) = ptr::replace(data, make_entry());
                     if let Some(stats) = &self.stats {
                         stats.record_insert(&(*data).0, &(*data).1, Some((&old_key, &old_value)));
                     }
@@ -480,7 +496,7 @@ where
                 }
             } else {
                 if Self::NEEDS_DROP && is_alive {
-                    std::ptr::drop_in_place(data);
+                    ptr::drop_in_place(data);
                 }
                 do_write(data, make_entry);
             }
@@ -531,14 +547,14 @@ where
     where
         F: FnOnce(&K) -> Result<V, E>,
     {
-        let mut key = std::mem::ManuallyDrop::new(key);
+        let mut key = mem::ManuallyDrop::new(key);
         let mut read = false;
         let r = self.get_or_try_insert_with_ref(&*key, f, |k| {
             read = true;
-            unsafe { std::ptr::read(k) }
+            unsafe { ptr::read(k) }
         });
         if !read {
-            unsafe { std::mem::ManuallyDrop::drop(&mut key) }
+            unsafe { mem::ManuallyDrop::drop(&mut key) }
         }
         r
     }
@@ -598,9 +614,10 @@ where
 
 impl<K, V, S, C: CacheConfig> Drop for Cache<K, V, S, C> {
     fn drop(&mut self) {
+        #[cfg(feature = "alloc")]
         if self.drop {
             // SAFETY: `Drop` has exclusive access.
-            drop(unsafe { Box::from_raw(self.entries.cast_mut()) });
+            drop(unsafe { alloc::boxed::Box::from_raw(self.entries.cast_mut()) });
         }
     }
 }
@@ -621,7 +638,7 @@ pub struct Bucket<T> {
 }
 
 impl<T> Bucket<T> {
-    const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
+    const NEEDS_DROP: bool = mem::needs_drop::<T>();
 
     // TODO: Not entirely correct.
     const IMPLS_COPY: bool = !Self::NEEDS_DROP;
