@@ -365,6 +365,8 @@ where
                     }
                     return Some(v);
                 }
+
+                cold_path();
             }
         } else if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
@@ -380,6 +382,7 @@ where
                 bucket.unlock(prev);
                 return Some(v);
             }
+            cold_path();
             bucket.unlock(prev);
         }
         #[cfg(feature = "stats")]
@@ -704,6 +707,10 @@ macro_rules! static_cache {
         $crate::Cache::new_static(&ENTRIES, $hasher)
     }};
 }
+
+#[inline(always)]
+#[cold]
+const fn cold_path() {}
 
 #[cfg(test)]
 mod tests {
