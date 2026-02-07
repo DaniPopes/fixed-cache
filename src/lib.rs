@@ -161,7 +161,9 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-    const ENTRY_IMPLS_COPY: bool = impls::impls!((K, V): Copy);
+
+    // TODO: Not entirely correct.
+    const ENTRY_IMPLS_COPY: bool = !Self::NEEDS_DROP;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -342,15 +344,15 @@ where
             // counter), no writer intervened and the data is consistent. This avoids acquiring
             // the lock entirely on cache hits, at the cost of occasionally discarding a read
             // if a concurrent write raced with us.
-            let tag2 = bucket.tag.load(Ordering::Acquire);
-            if (tag2 & LOCKED_BIT) == 0 && (tag2 & !VERSION_MASK) == tag {
+            let seqlock = bucket.tag.load(Ordering::Acquire);
+            if (seqlock & LOCKED_BIT) == 0 && (seqlock & !VERSION_MASK) == tag {
                 let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
                 if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
                     std::sync::atomic::compiler_fence(Ordering::Acquire);
                 } else {
                     std::sync::atomic::fence(Ordering::Acquire);
                 }
-                if tag2 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
+                if seqlock == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
                     #[cfg(feature = "stats")]
                     if C::STATS
                         && let Some(stats) = &self.stats
