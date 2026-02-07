@@ -329,7 +329,7 @@ where
                     return Some(v);
                 }
             }
-        } else if bucket.try_lock(Some(tag)) {
+        } else if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -340,10 +340,10 @@ where
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
-                bucket.unlock(tag);
+                bucket.unlock(prev & !LOCKED_BIT);
                 return Some(v);
             }
-            bucket.unlock(tag);
+            bucket.unlock(prev & !LOCKED_BIT);
         }
         #[cfg(feature = "stats")]
         if C::STATS
@@ -594,11 +594,6 @@ impl<T> Bucket<T> {
     #[inline]
     pub const fn new() -> Self {
         Self { tag: AtomicUsize::new(0), data: UnsafeCell::new(MaybeUninit::zeroed()) }
-    }
-
-    #[inline]
-    fn try_lock(&self, expected: Option<usize>) -> bool {
-        self.try_lock_ret(expected).is_some()
     }
 
     #[inline]
