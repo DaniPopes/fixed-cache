@@ -317,9 +317,11 @@ where
             let tag2 = bucket.tag.load(Ordering::Acquire);
             if (tag2 & LOCKED_BIT) == 0 && (tag2 & !VERSION_MASK) == tag {
                 let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
-                std::sync::atomic::compiler_fence(Ordering::Acquire);
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-                std::sync::atomic::fence(Ordering::Acquire);
+                if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+                    std::sync::atomic::compiler_fence(Ordering::Acquire);
+                } else {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                }
                 if tag2 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
                     #[cfg(feature = "stats")]
                     if C::STATS
