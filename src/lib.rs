@@ -19,6 +19,29 @@ mod stats;
 #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
 pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
 
+// Tag bit layout (64-bit):
+//
+//   63      56 55                              12 11        2  1  0
+//  +----------+----------------------------------+----------+--+--+
+//  |  version |          hash signature          |   epoch  | A| L|
+//  |  (8-bit) |  (variable, capacity-dependent)  | (10-bit) |  |  |
+//  +----------+----------------------------------+----------+--+--+
+//
+// L (locked): Set during writes. Readers (seqlock path) skip the bucket; locked-path readers
+//   fail the CAS and fall through to a miss. Writers fail the CAS and abandon the insert.
+// A (alive): Indicates the bucket contains initialized data. Cleared on remove, set on insert.
+//   Part of the tag identity: readers require it to match, so empty buckets are never "hit".
+// epoch: Tracks which epoch the entry belongs to, enabling O(1) cache invalidation via
+//   `Cache::clear`. Only present when `CacheConfig::EPOCHS` is true; otherwise these bits
+//   are part of the hash signature.
+// hash signature: Upper bits of the key's hash, used to reject non-matching keys without
+//   reading the bucket data. The exact width depends on the cache capacity (more buckets =
+//   fewer signature bits).
+// version: Monotonic counter incremented on every mutation (insert/remove). Used by the
+//   seqlock read path to detect concurrent writes: the reader snapshots the tag, speculatively
+//   reads the data, then verifies the tag hasn't changed. The 8-bit counter makes ABA
+//   wraparound (256 writes between two reader loads) effectively impossible in practice.
+
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
 const NEEDED_BITS: usize = 2;
@@ -27,6 +50,11 @@ const EPOCH_BITS: usize = 10;
 const EPOCH_SHIFT: usize = NEEDED_BITS;
 const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
 const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
+
+const VERSION_BITS: u32 = 8;
+const VERSION_SHIFT: u32 = usize::BITS - VERSION_BITS;
+const VERSION_MASK: usize = ((1usize << VERSION_BITS) - 1) << VERSION_SHIFT;
+const VERSION_INCREMENT: usize = 1usize << VERSION_SHIFT;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
@@ -70,6 +98,9 @@ impl CacheConfig for DefaultCacheConfig {}
 ///
 /// The cache is safe to share across threads (`Send + Sync`). All operations use atomic
 /// instructions and never block, making it suitable for high-contention scenarios.
+///
+/// For `Copy` entry types, reads use a seqlock pattern that avoids acquiring a lock entirely. This
+/// makes cache hits completely lock-free.
 ///
 /// # Limitations
 ///
@@ -133,6 +164,7 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+    const ENTRY_IMPLS_COPY: bool = Bucket::<(K, V)>::IMPLS_COPY;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -307,7 +339,36 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if bucket.try_lock(Some(tag)) {
+        if Self::ENTRY_IMPLS_COPY {
+            // Seqlock fast path: speculatively read the tag, then the data, then re-read
+            // the tag. If the tag hasn't changed between the two reads (including the version
+            // counter), no writer intervened and the data is consistent. This avoids acquiring
+            // the lock entirely on cache hits, at the cost of occasionally discarding a read
+            // if a concurrent write raced with us.
+
+            let seq1 = bucket.tag.load(Ordering::Acquire);
+            if (seq1 & LOCKED_BIT) == 0 && (seq1 & !VERSION_MASK) == tag {
+                // SAFETY: Speculative read. `(K, V): !Drop` (and ideally also `Copy`)
+                let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
+
+                // Skip fence on x86. Thanks to TSO, these loads are never reordered.
+                if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+                    std::sync::atomic::fence(Ordering::Acquire);
+                }
+
+                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
+                    #[cfg(feature = "stats")]
+                    if C::STATS
+                        && let Some(stats) = &self.stats
+                    {
+                        stats.record_hit(&ck, &v);
+                    }
+                    return Some(v);
+                }
+
+                cold_path();
+            }
+        } else if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -318,10 +379,11 @@ where
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
-                bucket.unlock(tag);
+                bucket.unlock(prev);
                 return Some(v);
             }
-            bucket.unlock(tag);
+            cold_path();
+            bucket.unlock(prev);
         }
         #[cfg(feature = "stats")]
         if C::STATS
@@ -335,7 +397,7 @@ where
     /// Insert an entry into the cache.
     pub fn insert(&self, key: K, value: V) {
         let (bucket, tag) = self.calc(&key);
-        self.insert_inner(|| key, || value, bucket, tag);
+        self.insert_inner(bucket, tag, || (key, value));
     }
 
     /// Remove an entry from the cache.
@@ -343,7 +405,7 @@ where
     /// Returns the value if the key was present in the cache.
     pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
-        if bucket.try_lock(Some(tag)) {
+        if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let data = unsafe { &mut *bucket.data.get() };
             let (ck, v) = unsafe { data.assume_init_ref() };
@@ -359,10 +421,11 @@ where
                     // SAFETY: We hold the lock, so we have exclusive access.
                     unsafe { data.assume_init_drop() };
                 }
-                bucket.unlock(0);
+                let new_version = prev.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+                bucket.unlock(new_version);
                 return Some(v);
             }
-            bucket.unlock(tag);
+            bucket.unlock(prev);
         }
         None
     }
@@ -370,58 +433,56 @@ where
     #[inline]
     fn insert_inner(
         &self,
-        make_key: impl FnOnce() -> K,
-        make_value: impl FnOnce() -> V,
         bucket: &Bucket<(K, V)>,
         tag: usize,
+        make_entry: impl FnOnce() -> (K, V),
     ) {
-        if let Some(prev_tag) = bucket.try_lock_ret(None) {
-            // SAFETY: We hold the lock, so we have exclusive access.
-            unsafe {
-                // Check if bucket had data (any bits besides LOCKED_BIT means it was written to)
-                let is_alive = (prev_tag & !LOCKED_BIT) != 0;
-                let data = (&mut *bucket.data.get()).as_mut_ptr();
+        #[inline(always)]
+        unsafe fn do_write<T>(ptr: *mut T, f: impl FnOnce() -> T) {
+            // This function is translated as:
+            // - allocate space for a T on the stack
+            // - call f() with the return value being put onto this stack space
+            // - memcpy from the stack to the heap
+            //
+            // Ideally we want LLVM to always realize that doing a stack
+            // allocation is unnecessary and optimize the code so it writes
+            // directly into the heap instead. It seems we get it to realize
+            // this most consistently if we put this critical line into it's
+            // own function instead of inlining it into the surrounding code.
+            unsafe { core::ptr::write(ptr, f()) };
+        }
 
+        let Some(locked) = bucket.try_lock_ret(None, true) else {
+            return;
+        };
+        let to_store = tag | (locked & VERSION_MASK);
+
+        // SAFETY: We hold the lock, so we have exclusive access.
+        unsafe {
+            let is_alive = locked & ALIVE_BIT != 0;
+            let data = bucket.data.get().cast::<(K, V)>();
+
+            if C::STATS && cfg!(feature = "stats") {
                 #[cfg(feature = "stats")]
-                if C::STATS {
-                    if is_alive {
-                        // Replace key/value and get the old ones for stats and dropping
-                        let old_key = std::ptr::replace(&raw mut (*data).0, make_key());
-                        let old_value = std::ptr::replace(&raw mut (*data).1, make_value());
-                        if let Some(stats) = &self.stats {
-                            stats.record_insert(
-                                &(*data).0,
-                                &(*data).1,
-                                Some((&old_key, &old_value)),
-                            );
-                        }
-                    } else {
-                        (&raw mut (*data).0).write(make_key());
-                        (&raw mut (*data).1).write(make_value());
-                        if let Some(stats) = &self.stats {
-                            stats.record_insert(&(*data).0, &(*data).1, None);
-                        }
+                if is_alive {
+                    let (old_key, old_value) = std::ptr::replace(data, make_entry());
+                    if let Some(stats) = &self.stats {
+                        stats.record_insert(&(*data).0, &(*data).1, Some((&old_key, &old_value)));
                     }
                 } else {
-                    if Self::NEEDS_DROP && is_alive {
-                        std::ptr::drop_in_place(data);
+                    do_write(data, make_entry);
+                    if let Some(stats) = &self.stats {
+                        stats.record_insert(&(*data).0, &(*data).1, None);
                     }
-                    (&raw mut (*data).0).write(make_key());
-                    (&raw mut (*data).1).write(make_value());
                 }
-
-                #[cfg(not(feature = "stats"))]
-                {
-                    // Drop old value if bucket was alive.
-                    if Self::NEEDS_DROP && is_alive {
-                        std::ptr::drop_in_place(data);
-                    }
-                    (&raw mut (*data).0).write(make_key());
-                    (&raw mut (*data).1).write(make_value());
+            } else {
+                if Self::NEEDS_DROP && is_alive {
+                    std::ptr::drop_in_place(data);
                 }
+                do_write(data, make_entry);
             }
-            bucket.unlock(tag);
         }
+        bucket.unlock(to_store);
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -433,7 +494,8 @@ where
     where
         F: FnOnce(&K) -> V,
     {
-        self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key))).unwrap()
+        let Ok(v) = self.get_or_try_insert_with(key, |key| Ok::<_, Infallible>(f(key)));
+        v
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -452,7 +514,8 @@ where
         F: FnOnce(&'a Q) -> V,
         Cvt: FnOnce(&'a Q) -> K,
     {
-        self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt).unwrap()
+        let Ok(v) = self.get_or_try_insert_with_ref(key, |key| Ok::<_, Infallible>(f(key)), cvt);
+        v
     }
 
     /// Gets a value from the cache, or attempts to insert one computed by `f` if not present.
@@ -502,7 +565,7 @@ where
             return Ok(v);
         }
         let value = f(key)?;
-        self.insert_inner(|| cvt(key), || value.clone(), bucket, tag);
+        self.insert_inner(bucket, tag, || (cvt(key), value.clone()));
         Ok(value)
     }
 
@@ -511,10 +574,7 @@ where
         let hash = self.hash_key(key);
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-        let mut tag = hash & self.tag_mask();
-        if Self::NEEDS_DROP {
-            tag |= ALIVE_BIT;
-        }
+        let mut tag = hash & self.tag_mask() & !VERSION_MASK | ALIVE_BIT;
         if C::EPOCHS {
             tag = (tag & !EPOCH_MASK) | ((self.epoch() << EPOCH_SHIFT) & EPOCH_MASK);
         }
@@ -560,6 +620,9 @@ pub struct Bucket<T> {
 impl<T> Bucket<T> {
     const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
 
+    // TODO: Not entirely correct.
+    const IMPLS_COPY: bool = !Self::NEEDS_DROP;
+
     /// Creates a new zeroed bucket.
     #[inline]
     pub const fn new() -> Self {
@@ -567,23 +630,24 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
-    fn try_lock(&self, expected: Option<usize>) -> bool {
-        self.try_lock_ret(expected).is_some()
-    }
-
-    #[inline]
-    fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
+    fn try_lock_ret(&self, expected: Option<usize>, bump_version: bool) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
-            if state != expected {
+            if state & !VERSION_MASK != expected {
                 return None;
             }
         } else if state & LOCKED_BIT != 0 {
             return None;
         }
+        let mut locked = state | LOCKED_BIT;
+        if bump_version {
+            let new_version = state.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+            locked = (locked & !VERSION_MASK) | new_version;
+        }
         self.tag
-            .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(state, locked, Ordering::Acquire, Ordering::Relaxed)
             .ok()
+            .map(|prev| if bump_version { locked } else { prev })
     }
 
     #[inline]
@@ -643,6 +707,10 @@ macro_rules! static_cache {
         $crate::Cache::new_static(&ENTRIES, $hasher)
     }};
 }
+
+#[inline(always)]
+#[cold]
+const fn cold_path() {}
 
 #[cfg(test)]
 mod tests {
@@ -925,6 +993,32 @@ mod tests {
     }
 
     #[test]
+    fn seqlock_aba() {
+        if cfg!(miri) {
+            return;
+        }
+
+        const VALUE_N: usize = 16;
+
+        let cache: Cache<u64, [u64; VALUE_N]> = new_cache(1024);
+        let n = iters(500_000);
+
+        run_concurrent(4, |t| {
+            if t == 0 {
+                for i in 0..n as u64 {
+                    cache.insert(1, [i; VALUE_N]);
+                }
+            } else {
+                for _ in 0..n {
+                    if let Some(v) = cache.get(&1) {
+                        assert!(v.windows(2).all(|w| w[0] == w[1]), "torn read: {v:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn concurrent_get_or_insert() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
@@ -1188,5 +1282,118 @@ mod tests {
             cache.clear();
             assert_eq!(cache.get(&42), None, "failed at clear #{i}");
         }
+    }
+
+    #[test]
+    fn remove_seqlock_type() {
+        let cache = new_cache::<u64, u64>(64);
+
+        cache.insert(1, 100);
+        assert_eq!(cache.get(&1), Some(100));
+
+        let removed = cache.remove(&1);
+        assert_eq!(removed, Some(100));
+        assert_eq!(cache.get(&1), None);
+
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+    }
+
+    #[test]
+    fn remove_then_reinsert_seqlock() {
+        let cache = new_cache::<u64, u64>(64);
+
+        for i in 0..100u64 {
+            cache.insert(1, i);
+            assert_eq!(cache.get(&1), Some(i));
+            assert_eq!(cache.remove(&1), Some(i));
+            assert_eq!(cache.get(&1), None);
+        }
+    }
+
+    #[test]
+    fn epoch_with_needs_drop() {
+        let cache: EpochCache<String, String> = EpochCache::new(4096, Default::default());
+
+        cache.insert("key".to_string(), "value".to_string());
+        assert_eq!(cache.get("key"), Some("value".to_string()));
+
+        cache.clear();
+        assert_eq!(cache.get("key"), None);
+
+        cache.insert("key".to_string(), "value2".to_string());
+        assert_eq!(cache.get("key"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn epoch_remove() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+
+        cache.insert(1, 100);
+        assert_eq!(cache.remove(&1), Some(100));
+        assert_eq!(cache.get(&1), None);
+
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+
+        cache.clear();
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.remove(&1), None);
+    }
+
+    #[test]
+    fn no_stats_needs_drop() {
+        let cache: NoStatsCache<String, String> = NoStatsCache::new(64, Default::default());
+
+        cache.insert("a".to_string(), "b".to_string());
+        assert_eq!(cache.get("a"), Some("b".to_string()));
+
+        cache.insert("a".to_string(), "c".to_string());
+        assert_eq!(cache.get("a"), Some("c".to_string()));
+
+        cache.remove(&"a".to_string());
+        assert_eq!(cache.get("a"), None);
+    }
+
+    #[test]
+    fn no_stats_get_or_insert() {
+        let cache: NoStatsCache<String, usize> = NoStatsCache::new(64, Default::default());
+
+        let v = cache.get_or_insert_with_ref("hello", |s| s.len(), |s| s.to_string());
+        assert_eq!(v, 5);
+
+        let v2 = cache.get_or_insert_with_ref("hello", |_| 999, |s| s.to_string());
+        assert_eq!(v2, 5);
+    }
+
+    #[test]
+    fn epoch_concurrent_seqlock() {
+        if cfg!(miri) {
+            return;
+        }
+
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+        let n = iters(10_000);
+
+        run_concurrent(4, |t| {
+            for i in 0..n as u64 {
+                match t {
+                    0 => {
+                        cache.insert(i % 50, i);
+                    }
+                    1 => {
+                        let _ = cache.get(&(i % 50));
+                    }
+                    2 => {
+                        if i % 100 == 0 {
+                            cache.clear();
+                        }
+                    }
+                    _ => {
+                        let _ = cache.remove(&(i % 50));
+                    }
+                }
+            }
+        });
     }
 }
