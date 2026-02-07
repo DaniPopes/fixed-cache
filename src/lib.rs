@@ -19,6 +19,29 @@ mod stats;
 #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
 pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
 
+// Tag bit layout (64-bit):
+//
+//   63      56 55                              12 11        2  1  0
+//  +----------+----------------------------------+----------+--+--+
+//  |  version |          hash signature          |   epoch  | A| L|
+//  |  (8-bit) |  (variable, capacity-dependent)  | (10-bit) |  |  |
+//  +----------+----------------------------------+----------+--+--+
+//
+// L (locked): Set during writes. Readers (seqlock path) skip the bucket; locked-path readers
+//   fail the CAS and fall through to a miss. Writers fail the CAS and abandon the insert.
+// A (alive): Indicates the bucket contains initialized data. Cleared on remove, set on insert.
+//   Part of the tag identity: readers require it to match, so empty buckets are never "hit".
+// epoch: Tracks which epoch the entry belongs to, enabling O(1) cache invalidation via
+//   `Cache::clear`. Only present when `CacheConfig::EPOCHS` is true; otherwise these bits
+//   are part of the hash signature.
+// hash signature: Upper bits of the key's hash, used to reject non-matching keys without
+//   reading the bucket data. The exact width depends on the cache capacity (more buckets =
+//   fewer signature bits).
+// version: Monotonic counter incremented on every mutation (insert/remove). Used by the
+//   seqlock read path to detect concurrent writes: the reader snapshots the tag, speculatively
+//   reads the data, then verifies the tag hasn't changed. The 8-bit counter makes ABA
+//   wraparound (256 writes between two reader loads) effectively impossible in practice.
+
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
 const NEEDED_BITS: usize = 2;
@@ -314,6 +337,11 @@ where
         tag: usize,
     ) -> Option<V> {
         if Self::ENTRY_IMPLS_COPY {
+            // Seqlock fast path: speculatively read the tag, then the data, then re-read
+            // the tag. If the tag hasn't changed between the two reads (including the version
+            // counter), no writer intervened and the data is consistent. This avoids acquiring
+            // the lock entirely on cache hits, at the cost of occasionally discarding a read
+            // if a concurrent write raced with us.
             let tag2 = bucket.tag.load(Ordering::Acquire);
             if (tag2 & LOCKED_BIT) == 0 && (tag2 & !VERSION_MASK) == tag {
                 let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
@@ -332,7 +360,7 @@ where
                     return Some(v);
                 }
             }
-        } else if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
+        } else if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -343,10 +371,10 @@ where
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
-                bucket.unlock(prev & !LOCKED_BIT);
+                bucket.unlock(prev);
                 return Some(v);
             }
-            bucket.unlock(prev & !LOCKED_BIT);
+            bucket.unlock(prev);
         }
         #[cfg(feature = "stats")]
         if C::STATS
@@ -368,7 +396,7 @@ where
     /// Returns the value if the key was present in the cache.
     pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
-        if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
+        if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let data = unsafe { &mut *bucket.data.get() };
             let (ck, v) = unsafe { data.assume_init_ref() };
@@ -388,8 +416,7 @@ where
                 bucket.unlock(new_version);
                 return Some(v);
             }
-            let new_version = prev & VERSION_MASK;
-            bucket.unlock(tag | new_version);
+            bucket.unlock(prev);
         }
         None
     }
@@ -416,23 +443,14 @@ where
             unsafe { core::ptr::write(ptr, f()) };
         }
 
-        let existing = bucket.tag.load(Ordering::Relaxed);
-        if existing & LOCKED_BIT != 0 {
+        let Some(locked) = bucket.try_lock_ret(None, true) else {
             return;
-        }
-        let new_version = existing.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
-        let to_store = tag | new_version;
-        if bucket
-            .tag
-            .compare_exchange(existing, to_store | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
+        };
+        let to_store = tag | (locked & VERSION_MASK);
 
         // SAFETY: We hold the lock, so we have exclusive access.
         unsafe {
-            let is_alive = existing & ALIVE_BIT != 0;
+            let is_alive = locked & ALIVE_BIT != 0;
             let data = bucket.data.get().cast::<(K, V)>();
 
             if C::STATS && cfg!(feature = "stats") {
@@ -600,7 +618,7 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
-    fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
+    fn try_lock_ret(&self, expected: Option<usize>, bump_version: bool) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
             if state & !VERSION_MASK != expected {
@@ -609,9 +627,15 @@ impl<T> Bucket<T> {
         } else if state & LOCKED_BIT != 0 {
             return None;
         }
+        let mut locked = state | LOCKED_BIT;
+        if bump_version {
+            let new_version = state.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+            locked = (locked & !VERSION_MASK) | new_version;
+        }
         self.tag
-            .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(state, locked, Ordering::Acquire, Ordering::Relaxed)
             .ok()
+            .map(|prev| if bump_version { locked } else { prev })
     }
 
     #[inline]
