@@ -28,6 +28,11 @@ const EPOCH_SHIFT: usize = NEEDED_BITS;
 const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
 const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
 
+const VERSION_BITS: u32 = 8;
+const VERSION_SHIFT: u32 = usize::BITS - VERSION_BITS;
+const VERSION_MASK: usize = ((1usize << VERSION_BITS) - 1) << VERSION_SHIFT;
+const VERSION_INCREMENT: usize = 1usize << VERSION_SHIFT;
+
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
 #[cfg(not(feature = "rapidhash"))]
@@ -308,20 +313,13 @@ where
         tag: usize,
     ) -> Option<V> {
         if !Self::NEEDS_DROP {
-            // Lock-free speculative read for types without destructors.
-            //
-            // 1. Load tag (Acquire — orders subsequent reads after this).
-            // 2. Speculatively read data via ptr::read (no lock held).
-            // 3. Re-load tag — if unchanged, no writer was active during our window.
-            // 4. Validate key and return.
-            //
-            // SAFETY: `!NEEDS_DROP` guarantees no destructors, so a speculative read cannot
-            // cause use-after-free. If a concurrent write produces a torn read, the tag re-check
-            // will detect it (the writer changes the tag under its lock/unlock cycle).
-            let seq1 = bucket.tag.load(Ordering::Acquire);
-            if seq1 == tag {
-                let (ck, v) = unsafe { std::ptr::read(bucket.data.get().cast::<(K, V)>()) };
-                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
+            let tag2 = bucket.tag.load(Ordering::Acquire);
+            if (tag2 & LOCKED_BIT) == 0 && (tag2 & !VERSION_MASK) == tag {
+                let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
+                std::sync::atomic::compiler_fence(Ordering::AcqRel);
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+                std::sync::atomic::fence(Ordering::Acquire);
+                if tag2 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
                     #[cfg(feature = "stats")]
                     if C::STATS
                         && let Some(stats) = &self.stats
@@ -367,7 +365,7 @@ where
     /// Returns the value if the key was present in the cache.
     pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
-        if bucket.try_lock(Some(tag)) {
+        if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let data = unsafe { &mut *bucket.data.get() };
             let (ck, v) = unsafe { data.assume_init_ref() };
@@ -383,10 +381,12 @@ where
                     // SAFETY: We hold the lock, so we have exclusive access.
                     unsafe { data.assume_init_drop() };
                 }
-                bucket.unlock(0);
+                let new_version = prev.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+                bucket.unlock(new_version);
                 return Some(v);
             }
-            bucket.unlock(tag);
+            let new_version = prev & VERSION_MASK;
+            bucket.unlock(tag | new_version);
         }
         None
     }
@@ -413,40 +413,46 @@ where
             unsafe { core::ptr::write(ptr, f()) };
         }
 
-        if let Some(prev_tag) = bucket.try_lock_ret(None) {
-            // SAFETY: We hold the lock, so we have exclusive access.
-            unsafe {
-                // Check if bucket had data (any bits besides LOCKED_BIT means it was written to)
-                let is_alive = (prev_tag & !LOCKED_BIT) != 0;
-                let data = (&mut *bucket.data.get()).as_mut_ptr();
+        let existing = bucket.tag.load(Ordering::Relaxed);
+        if existing & LOCKED_BIT != 0 {
+            return;
+        }
+        let new_version = existing.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
+        let to_store = tag | new_version;
+        if bucket
+            .tag
+            .compare_exchange(existing, to_store | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
 
-                if C::STATS && cfg!(feature = "stats") {
-                    #[cfg(feature = "stats")]
-                    if is_alive {
-                        // Replace key/value and get the old ones for stats and dropping
-                        let (old_key, old_value) = std::ptr::replace(data, make_entry());
-                        if let Some(stats) = &self.stats {
-                            stats.record_insert(
-                                &(*data).0,
-                                &(*data).1,
-                                Some((&old_key, &old_value)),
-                            );
-                        }
-                    } else {
-                        do_write(data, make_entry);
-                        if let Some(stats) = &self.stats {
-                            stats.record_insert(&(*data).0, &(*data).1, None);
-                        }
+        // SAFETY: We hold the lock, so we have exclusive access.
+        unsafe {
+            let is_alive = existing & ALIVE_BIT != 0;
+            let data = bucket.data.get().cast::<(K, V)>();
+
+            if C::STATS && cfg!(feature = "stats") {
+                #[cfg(feature = "stats")]
+                if is_alive {
+                    let (old_key, old_value) = std::ptr::replace(data, make_entry());
+                    if let Some(stats) = &self.stats {
+                        stats.record_insert(&(*data).0, &(*data).1, Some((&old_key, &old_value)));
                     }
                 } else {
-                    if Self::NEEDS_DROP && is_alive {
-                        std::ptr::drop_in_place(data);
-                    }
                     do_write(data, make_entry);
+                    if let Some(stats) = &self.stats {
+                        stats.record_insert(&(*data).0, &(*data).1, None);
+                    }
                 }
+            } else {
+                if Self::NEEDS_DROP && is_alive {
+                    std::ptr::drop_in_place(data);
+                }
+                do_write(data, make_entry);
             }
-            bucket.unlock(tag);
         }
+        bucket.unlock(to_store);
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -538,10 +544,7 @@ where
         let hash = self.hash_key(key);
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-        let mut tag = hash & self.tag_mask();
-        if Self::NEEDS_DROP {
-            tag |= ALIVE_BIT;
-        }
+        let mut tag = hash & self.tag_mask() & !VERSION_MASK | ALIVE_BIT;
         if C::EPOCHS {
             tag = (tag & !EPOCH_MASK) | ((self.epoch() << EPOCH_SHIFT) & EPOCH_MASK);
         }
@@ -602,7 +605,7 @@ impl<T> Bucket<T> {
     fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
-            if state != expected {
+            if state & !VERSION_MASK != expected {
                 return None;
             }
         } else if state & LOCKED_BIT != 0 {
@@ -1241,5 +1244,118 @@ mod tests {
             cache.clear();
             assert_eq!(cache.get(&42), None, "failed at clear #{i}");
         }
+    }
+
+    #[test]
+    fn remove_seqlock_type() {
+        let cache = new_cache::<u64, u64>(64);
+
+        cache.insert(1, 100);
+        assert_eq!(cache.get(&1), Some(100));
+
+        let removed = cache.remove(&1);
+        assert_eq!(removed, Some(100));
+        assert_eq!(cache.get(&1), None);
+
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+    }
+
+    #[test]
+    fn remove_then_reinsert_seqlock() {
+        let cache = new_cache::<u64, u64>(64);
+
+        for i in 0..100u64 {
+            cache.insert(1, i);
+            assert_eq!(cache.get(&1), Some(i));
+            assert_eq!(cache.remove(&1), Some(i));
+            assert_eq!(cache.get(&1), None);
+        }
+    }
+
+    #[test]
+    fn epoch_with_needs_drop() {
+        let cache: EpochCache<String, String> = EpochCache::new(4096, Default::default());
+
+        cache.insert("key".to_string(), "value".to_string());
+        assert_eq!(cache.get("key"), Some("value".to_string()));
+
+        cache.clear();
+        assert_eq!(cache.get("key"), None);
+
+        cache.insert("key".to_string(), "value2".to_string());
+        assert_eq!(cache.get("key"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn epoch_remove() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+
+        cache.insert(1, 100);
+        assert_eq!(cache.remove(&1), Some(100));
+        assert_eq!(cache.get(&1), None);
+
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+
+        cache.clear();
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.remove(&1), None);
+    }
+
+    #[test]
+    fn no_stats_needs_drop() {
+        let cache: NoStatsCache<String, String> = NoStatsCache::new(64, Default::default());
+
+        cache.insert("a".to_string(), "b".to_string());
+        assert_eq!(cache.get("a"), Some("b".to_string()));
+
+        cache.insert("a".to_string(), "c".to_string());
+        assert_eq!(cache.get("a"), Some("c".to_string()));
+
+        cache.remove(&"a".to_string());
+        assert_eq!(cache.get("a"), None);
+    }
+
+    #[test]
+    fn no_stats_get_or_insert() {
+        let cache: NoStatsCache<String, usize> = NoStatsCache::new(64, Default::default());
+
+        let v = cache.get_or_insert_with_ref("hello", |s| s.len(), |s| s.to_string());
+        assert_eq!(v, 5);
+
+        let v2 = cache.get_or_insert_with_ref("hello", |_| 999, |s| s.to_string());
+        assert_eq!(v2, 5);
+    }
+
+    #[test]
+    fn epoch_concurrent_seqlock() {
+        if cfg!(miri) {
+            return;
+        }
+
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+        let n = iters(10_000);
+
+        run_concurrent(4, |t| {
+            for i in 0..n as u64 {
+                match t {
+                    0 => {
+                        cache.insert(i % 50, i);
+                    }
+                    1 => {
+                        let _ = cache.get(&(i % 50));
+                    }
+                    2 => {
+                        if i % 100 == 0 {
+                            cache.clear();
+                        }
+                    }
+                    _ => {
+                        let _ = cache.remove(&(i % 50));
+                    }
+                }
+            }
+        });
     }
 }
