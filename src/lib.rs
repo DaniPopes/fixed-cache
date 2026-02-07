@@ -344,15 +344,18 @@ where
             // counter), no writer intervened and the data is consistent. This avoids acquiring
             // the lock entirely on cache hits, at the cost of occasionally discarding a read
             // if a concurrent write raced with us.
-            let seqlock = bucket.tag.load(Ordering::Acquire);
-            if (seqlock & LOCKED_BIT) == 0 && (seqlock & !VERSION_MASK) == tag {
+
+            let seq1 = bucket.tag.load(Ordering::Acquire);
+            if (seq1 & LOCKED_BIT) == 0 && (seq1 & !VERSION_MASK) == tag {
+                // SAFETY: Speculative read. `(K, V): !Drop` (and ideally also `Copy`)
                 let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
-                if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
-                    std::sync::atomic::compiler_fence(Ordering::Acquire);
-                } else {
+
+                // Skip fence on x86. Thanks to TSO, these loads are never reordered.
+                if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
                     std::sync::atomic::fence(Ordering::Acquire);
                 }
-                if seqlock == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
+
+                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
                     #[cfg(feature = "stats")]
                     if C::STATS
                         && let Some(stats) = &self.stats
