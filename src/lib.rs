@@ -99,6 +99,9 @@ impl CacheConfig for DefaultCacheConfig {}
 /// The cache is safe to share across threads (`Send + Sync`). All operations use atomic
 /// instructions and never block, making it suitable for high-contention scenarios.
 ///
+/// For `Copy` entry types, reads use a seqlock pattern that avoids acquiring a lock entirely. This
+/// makes cache hits completely lock-free.
+///
 /// # Limitations
 ///
 /// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.

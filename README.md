@@ -9,7 +9,8 @@ with predictable memory usage and minimal overhead.
 ## Features
 
 - **Fixed size**: Memory is allocated once at creation time
-- **Lock-free reads**: Uses atomic operations for thread-safe access without blocking
+- **Lock-free reads**: For types that don't require drop, reads use a seqlock pattern
+  that never acquires a lock. Other types fall back to a CAS-based lock
 - **Zero dependencies** (optional `rapidhash` for faster hashing)
 - **`no_std` compatible** (with `alloc`)
 - **Static initialization**: Create caches at compile time with the `static_cache!` macro
