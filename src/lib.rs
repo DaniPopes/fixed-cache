@@ -179,7 +179,6 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-    const ENTRY_IMPLS_COPY: bool = Bucket::<(K, V)>::IMPLS_COPY;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -358,36 +357,7 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if Self::ENTRY_IMPLS_COPY {
-            // Seqlock fast path: speculatively read the tag, then the data, then re-read
-            // the tag. If the tag hasn't changed between the two reads (including the version
-            // counter), no writer intervened and the data is consistent. This avoids acquiring
-            // the lock entirely on cache hits, at the cost of occasionally discarding a read
-            // if a concurrent write raced with us.
-
-            let seq1 = bucket.tag.load(Ordering::Acquire);
-            if (seq1 & LOCKED_BIT) == 0 && (seq1 & !VERSION_MASK) == tag {
-                // SAFETY: Speculative read. `(K, V): !Drop` (and ideally also `Copy`)
-                let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
-
-                // Skip fence on x86. Thanks to TSO, these loads are never reordered.
-                if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
-                    atomic::fence(Ordering::Acquire);
-                }
-
-                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
-                    #[cfg(feature = "stats")]
-                    if C::STATS
-                        && let Some(stats) = &self.stats
-                    {
-                        stats.record_hit(&ck, &v);
-                    }
-                    return Some(v);
-                }
-
-                cold_path();
-            }
-        } else if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
+        if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -612,6 +582,64 @@ where
     }
 }
 
+impl<K, V, S, C> Cache<K, V, S, C>
+where
+    K: Hash + Eq + Copy,
+    V: Clone + Copy,
+    S: BuildHasher,
+    C: CacheConfig,
+{
+    /// Get an entry from the cache using the lock-free seqlock read path.
+    ///
+    /// This method is only available when both key and value are `Copy`.
+    #[inline]
+    pub fn get_copy<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
+        let (bucket, tag) = self.calc(key);
+
+        // Seqlock fast path: speculatively read the tag, then the data, then re-read
+        // the tag. If the tag hasn't changed between the two reads (including the version
+        // counter), no writer intervened and the data is consistent. This avoids acquiring
+        // the lock entirely on cache hits, at the cost of occasionally discarding a read
+        // if a concurrent write raced with us.
+        let seq1 = bucket.tag.load(Ordering::Acquire);
+        if (seq1 & LOCKED_BIT) == 0 && (seq1 & !VERSION_MASK) == tag {
+            // SAFETY: Speculative read into MaybeUninit. We don't assume_init
+            // until seqlock validation confirms no concurrent writer.
+            let snapshot = unsafe { ptr::read(bucket.data.get()) };
+
+            // Skip fence on x86. Thanks to TSO, these loads are never reordered.
+            if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+                atomic::fence(Ordering::Acquire);
+            }
+
+            // Validate seqlock BEFORE assume_init to avoid creating values
+            // with potentially invalid bit patterns from torn reads.
+            if seq1 == bucket.tag.load(Ordering::Acquire) {
+                // SAFETY: Seqlock validated - no writer intervened, data is consistent.
+                let (ck, v) = unsafe { snapshot.assume_init() };
+                if key.equivalent(&ck) {
+                    #[cfg(feature = "stats")]
+                    if C::STATS
+                        && let Some(stats) = &self.stats
+                    {
+                        stats.record_hit(&ck, &v);
+                    }
+                    return Some(v);
+                }
+            }
+            // snapshot is MaybeUninit - no Drop runs, torn data is safely discarded
+            cold_path();
+        }
+        #[cfg(feature = "stats")]
+        if C::STATS
+            && let Some(stats) = &self.stats
+        {
+            stats.record_miss(AnyRef::new(&key));
+        }
+        None
+    }
+}
+
 impl<K, V, S, C: CacheConfig> Drop for Cache<K, V, S, C> {
     fn drop(&mut self) {
         #[cfg(feature = "alloc")]
@@ -639,9 +667,6 @@ pub struct Bucket<T> {
 
 impl<T> Bucket<T> {
     const NEEDS_DROP: bool = mem::needs_drop::<T>();
-
-    // TODO: Not entirely correct.
-    const IMPLS_COPY: bool = !Self::NEEDS_DROP;
 
     /// Creates a new zeroed bucket.
     #[inline]
@@ -805,6 +830,15 @@ mod tests {
     fn get_miss() {
         let cache = new_cache::<u64, u64>(64);
         assert_eq!(cache.get(&999), None);
+    }
+
+    #[test]
+    fn get_copy_hit_and_miss() {
+        let cache = new_cache::<u64, u64>(64);
+        cache.insert(7, 14);
+
+        assert_eq!(cache.get_copy(&7), Some(14));
+        assert_eq!(cache.get_copy(&8), None);
     }
 
     #[test]
