@@ -9,8 +9,7 @@ with predictable memory usage and minimal overhead.
 ## Features
 
 - **Fixed size**: Memory is allocated once at creation time
-- **Lock-free reads**: For types that don't require drop, reads use a seqlock pattern
-  that never acquires a lock. Other types fall back to a CAS-based lock
+- **Lock-free reads**: Uses atomic operations for thread-safe access without blocking
 - **Zero dependencies** (optional `rapidhash` for faster hashing)
 - **`no_std` compatible** (with `alloc`)
 - **Static initialization**: Create caches at compile time with the `static_cache!` macro
@@ -81,9 +80,6 @@ This design is ideal for memoization caches where:
 
 - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 - **No iteration**: Individual entries cannot be enumerated.
-- **`Clone + !Drop` types**: The lock-free read path uses `!needs_drop` as a proxy for `Copy`,
-  so types that implement `Clone` with non-trivial logic but don't implement `Drop` will be
-  bitwise-copied instead of cloned on reads. Avoid using such types as keys or values.
 
 ## Feature Flags
 

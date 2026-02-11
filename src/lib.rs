@@ -14,7 +14,7 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     ptr,
-    sync::atomic::{self, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use equivalent::Equivalent;
 
@@ -24,29 +24,6 @@ mod stats;
 #[cfg_attr(docsrs, doc(cfg(feature = "stats")))]
 pub use stats::{AnyRef, CountingStatsHandler, Stats, StatsHandler};
 
-// Tag bit layout (64-bit):
-//
-//   63      56 55                              12 11        2  1  0
-//  +----------+----------------------------------+----------+--+--+
-//  |  version |          hash signature          |   epoch  | A| L|
-//  |  (8-bit) |  (variable, capacity-dependent)  | (10-bit) |  |  |
-//  +----------+----------------------------------+----------+--+--+
-//
-// L (locked): Set during writes. Readers (seqlock path) skip the bucket; locked-path readers
-//   fail the CAS and fall through to a miss. Writers fail the CAS and abandon the insert.
-// A (alive): Indicates the bucket contains initialized data. Cleared on remove, set on insert.
-//   Part of the tag identity: readers require it to match, so empty buckets are never "hit".
-// epoch: Tracks which epoch the entry belongs to, enabling O(1) cache invalidation via
-//   `Cache::clear`. Only present when `CacheConfig::EPOCHS` is true; otherwise these bits
-//   are part of the hash signature.
-// hash signature: Upper bits of the key's hash, used to reject non-matching keys without
-//   reading the bucket data. The exact width depends on the cache capacity (more buckets =
-//   fewer signature bits).
-// version: Monotonic counter incremented on every mutation (insert/remove). Used by the
-//   seqlock read path to detect concurrent writes: the reader snapshots the tag, speculatively
-//   reads the data, then verifies the tag hasn't changed. The 8-bit counter makes ABA
-//   wraparound (256 writes between two reader loads) effectively impossible in practice.
-
 const LOCKED_BIT: usize = 1 << 0;
 const ALIVE_BIT: usize = 1 << 1;
 const NEEDED_BITS: usize = 2;
@@ -55,11 +32,6 @@ const EPOCH_BITS: usize = 10;
 const EPOCH_SHIFT: usize = NEEDED_BITS;
 const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
 const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
-
-const VERSION_BITS: u32 = 8;
-const VERSION_SHIFT: u32 = usize::BITS - VERSION_BITS;
-const VERSION_MASK: usize = ((1usize << VERSION_BITS) - 1) << VERSION_SHIFT;
-const VERSION_INCREMENT: usize = 1usize << VERSION_SHIFT;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = core::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
@@ -110,16 +82,10 @@ impl CacheConfig for DefaultCacheConfig {}
 /// The cache is safe to share across threads (`Send + Sync`). All operations use atomic
 /// instructions and never block, making it suitable for high-contention scenarios.
 ///
-/// For `Copy` entry types, reads use a seqlock pattern that avoids acquiring a lock entirely. This
-/// makes cache hits completely lock-free.
-///
 /// # Limitations
 ///
 /// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 /// - **No iteration**: Individual entries cannot be enumerated.
-/// - **`Clone + !Drop` types**: The lock-free read path uses `!needs_drop` as a proxy for `Copy`,
-///   so types that implement `Clone` with non-trivial logic but don't implement `Drop` will be
-///   bitwise-copied instead of cloned on reads. Avoid using such types as keys or values.
 ///
 /// # Type Parameters
 ///
@@ -179,7 +145,6 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
-    const ENTRY_IMPLS_COPY: bool = Bucket::<(K, V)>::IMPLS_COPY;
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -358,36 +323,7 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if Self::ENTRY_IMPLS_COPY {
-            // Seqlock fast path: speculatively read the tag, then the data, then re-read
-            // the tag. If the tag hasn't changed between the two reads (including the version
-            // counter), no writer intervened and the data is consistent. This avoids acquiring
-            // the lock entirely on cache hits, at the cost of occasionally discarding a read
-            // if a concurrent write raced with us.
-
-            let seq1 = bucket.tag.load(Ordering::Acquire);
-            if (seq1 & LOCKED_BIT) == 0 && (seq1 & !VERSION_MASK) == tag {
-                // SAFETY: Speculative read. `(K, V): !Drop` (and ideally also `Copy`)
-                let (ck, v) = unsafe { bucket.data.get().cast::<(K, V)>().read() };
-
-                // Skip fence on x86. Thanks to TSO, these loads are never reordered.
-                if !cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
-                    atomic::fence(Ordering::Acquire);
-                }
-
-                if seq1 == bucket.tag.load(Ordering::Acquire) && key.equivalent(&ck) {
-                    #[cfg(feature = "stats")]
-                    if C::STATS
-                        && let Some(stats) = &self.stats
-                    {
-                        stats.record_hit(&ck, &v);
-                    }
-                    return Some(v);
-                }
-
-                cold_path();
-            }
-        } else if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
+        if bucket.try_lock(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -398,11 +334,10 @@ where
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
-                bucket.unlock(prev);
+                bucket.unlock(tag);
                 return Some(v);
             }
-            cold_path();
-            bucket.unlock(prev);
+            bucket.unlock(tag);
         }
         #[cfg(feature = "stats")]
         if C::STATS
@@ -424,7 +359,7 @@ where
     /// Returns the value if the key was present in the cache.
     pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
-        if let Some(prev) = bucket.try_lock_ret(Some(tag), false) {
+        if bucket.try_lock(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let data = unsafe { &mut *bucket.data.get() };
             let (ck, v) = unsafe { data.assume_init_ref() };
@@ -440,11 +375,10 @@ where
                     // SAFETY: We hold the lock, so we have exclusive access.
                     unsafe { data.assume_init_drop() };
                 }
-                let new_version = prev.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
-                bucket.unlock(new_version);
+                bucket.unlock(0);
                 return Some(v);
             }
-            bucket.unlock(prev);
+            bucket.unlock(tag);
         }
         None
     }
@@ -471,14 +405,13 @@ where
             unsafe { ptr::write(ptr, f()) };
         }
 
-        let Some(locked) = bucket.try_lock_ret(None, true) else {
+        let Some(prev_tag) = bucket.try_lock_ret(None) else {
             return;
         };
-        let to_store = tag | (locked & VERSION_MASK);
 
         // SAFETY: We hold the lock, so we have exclusive access.
         unsafe {
-            let is_alive = locked & ALIVE_BIT != 0;
+            let is_alive = (prev_tag & !LOCKED_BIT) != 0;
             let data = bucket.data.get().cast::<(K, V)>();
 
             if C::STATS && cfg!(feature = "stats") {
@@ -501,7 +434,7 @@ where
                 do_write(data, make_entry);
             }
         }
-        bucket.unlock(to_store);
+        bucket.unlock(tag);
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -593,7 +526,10 @@ where
         let hash = self.hash_key(key);
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-        let mut tag = hash & self.tag_mask() & !VERSION_MASK | ALIVE_BIT;
+        let mut tag = hash & self.tag_mask();
+        if Self::NEEDS_DROP {
+            tag |= ALIVE_BIT;
+        }
         if C::EPOCHS {
             tag = (tag & !EPOCH_MASK) | ((self.epoch() << EPOCH_SHIFT) & EPOCH_MASK);
         }
@@ -640,9 +576,6 @@ pub struct Bucket<T> {
 impl<T> Bucket<T> {
     const NEEDS_DROP: bool = mem::needs_drop::<T>();
 
-    // TODO: Not entirely correct.
-    const IMPLS_COPY: bool = !Self::NEEDS_DROP;
-
     /// Creates a new zeroed bucket.
     #[inline]
     pub const fn new() -> Self {
@@ -650,24 +583,23 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
-    fn try_lock_ret(&self, expected: Option<usize>, bump_version: bool) -> Option<usize> {
+    fn try_lock(&self, expected: Option<usize>) -> bool {
+        self.try_lock_ret(expected).is_some()
+    }
+
+    #[inline]
+    fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
-            if state & !VERSION_MASK != expected {
+            if state != expected {
                 return None;
             }
         } else if state & LOCKED_BIT != 0 {
             return None;
         }
-        let mut locked = state | LOCKED_BIT;
-        if bump_version {
-            let new_version = state.wrapping_add(VERSION_INCREMENT) & VERSION_MASK;
-            locked = (locked & !VERSION_MASK) | new_version;
-        }
         self.tag
-            .compare_exchange(state, locked, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|prev| if bump_version { locked } else { prev })
     }
 
     #[inline]
@@ -727,10 +659,6 @@ macro_rules! static_cache {
         $crate::Cache::new_static(&ENTRIES, $hasher)
     }};
 }
-
-#[inline(always)]
-#[cold]
-const fn cold_path() {}
 
 #[cfg(test)]
 mod tests {
@@ -998,11 +926,6 @@ mod tests {
 
     #[test]
     fn concurrent_read_write() {
-        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
-        if cfg!(miri) {
-            return;
-        }
-
         let cache: Cache<u64, u64> = new_cache(256);
         let n = iters(1000);
 
@@ -1018,39 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn seqlock_aba() {
-        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
-        if cfg!(miri) {
-            return;
-        }
-
-        const VALUE_N: usize = 16;
-
-        let cache: Cache<u64, [u64; VALUE_N]> = new_cache(1024);
-        let n = iters(500_000);
-
-        run_concurrent(4, |t| {
-            if t == 0 {
-                for i in 0..n as u64 {
-                    cache.insert(1, [i; VALUE_N]);
-                }
-            } else {
-                for _ in 0..n {
-                    if let Some(v) = cache.get(&1) {
-                        assert!(v.windows(2).all(|w| w[0] == w[1]), "torn read: {v:?}");
-                    }
-                }
-            }
-        });
-    }
-
-    #[test]
     fn concurrent_get_or_insert() {
-        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
-        if cfg!(miri) {
-            return;
-        }
-
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -1316,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_seqlock_type() {
+    fn remove_copy_type() {
         let cache = new_cache::<u64, u64>(64);
 
         cache.insert(1, 100);
@@ -1331,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_then_reinsert_seqlock() {
+    fn remove_then_reinsert_copy() {
         let cache = new_cache::<u64, u64>(64);
 
         for i in 0..100u64 {
@@ -1398,12 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_concurrent_seqlock() {
-        // Miri flags the seqlock's speculative read as a data race with concurrent writers.
-        if cfg!(miri) {
-            return;
-        }
-
+    fn epoch_concurrent() {
         let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
         let n = iters(10_000);
 
