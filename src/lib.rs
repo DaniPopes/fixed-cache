@@ -256,7 +256,8 @@ where
         const EPOCH_MAX: usize = (1 << EPOCH_BITS) - 1;
         const { assert!(C::EPOCHS, "can only .clear() when C::EPOCHS is true") }
         let prev = self.epoch.fetch_add(1, Ordering::Release);
-        if prev == EPOCH_MAX {
+        // Tags store only the low EPOCH_BITS of the epoch, clear the cache on every low-bit wrap.
+        if (prev & EPOCH_MAX) == EPOCH_MAX {
             self.clear_slow();
         }
     }
@@ -1201,6 +1202,23 @@ mod tests {
         assert_eq!(cache.get(&42), Some(123));
 
         for i in 0..2048 {
+            cache.clear();
+            assert_eq!(cache.get(&42), None, "failed at clear #{i}");
+        }
+    }
+
+    #[test]
+    fn epoch_repeated_wraparound_stays_cleared() {
+        let cache: EpochCache<u64, u64> = EpochCache::new(4096, Default::default());
+
+        for _ in 0..1024 {
+            cache.clear();
+        }
+
+        cache.insert(42, 123);
+        assert_eq!(cache.get(&42), Some(123));
+
+        for i in 0..1024 {
             cache.clear();
             assert_eq!(cache.get(&42), None, "failed at clear #{i}");
         }
