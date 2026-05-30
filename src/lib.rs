@@ -262,7 +262,7 @@ where
         }
     }
 
-    /// Clears the cache by zeroing all bucket memory.
+    /// Clears the cache by invalidating all buckets.
     ///
     /// This is O(N) where N is the number of buckets. Prefer [`clear`](Self::clear) when
     /// [`CacheConfig::EPOCHS`] is `true`.
@@ -271,17 +271,18 @@ where
     ///
     /// This method is safe but may race with concurrent operations. Callers should ensure
     /// no other threads are accessing the cache during this operation.
+    #[inline(never)]
     pub fn clear_slow(&self) {
-        // SAFETY: We zero the entire bucket array. This is safe because:
-        // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
-        // - We don't need to drop existing entries since we're zeroing the ALIVE_BIT.
-        // - Concurrent readers will see either the old state or zeros (empty).
+        // SAFETY: Callers ensure no other threads are accessing the cache.
         unsafe {
-            ptr::write_bytes(
-                self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
-                0,
-                self.entries.len(),
-            )
+            for entry in &*self.entries {
+                let is_alive = Self::NEEDS_DROP && entry.is_alive();
+                // Store before dropping to avoid double-dropping if dropping panics.
+                entry.tag.store(0, Ordering::Relaxed);
+                if is_alive {
+                    (*entry.data.get()).assume_init_drop();
+                }
+            }
         };
     }
 
@@ -664,7 +665,7 @@ macro_rules! static_cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{cell::Cell, rc::Rc, thread};
 
     const fn iters(n: usize) -> usize {
         if cfg!(miri) { n / 10 } else { n }
@@ -687,6 +688,63 @@ mod tests {
 
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
+    }
+
+    type Drops = Rc<Cell<usize>>;
+
+    fn drops() -> Drops {
+        Rc::new(Cell::new(0))
+    }
+
+    #[derive(Clone)]
+    struct DropKey {
+        id: u64,
+        drops: Drops,
+    }
+
+    impl DropKey {
+        fn new(id: u64, drops: &Drops) -> Self {
+            Self { id, drops: drops.clone() }
+        }
+    }
+
+    impl Hash for DropKey {
+        fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    impl PartialEq for DropKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for DropKey {}
+
+    impl Drop for DropKey {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    #[derive(Clone)]
+    struct DropValue {
+        #[allow(dead_code)]
+        value: u64,
+        drops: Drops,
+    }
+
+    impl DropValue {
+        fn new(value: u64, drops: &Drops) -> Self {
+            Self { value, drops: drops.clone() }
+        }
+    }
+
+    impl Drop for DropValue {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
     }
 
     #[test]
@@ -1069,74 +1127,34 @@ mod tests {
 
     #[test]
     fn drop_on_cache_drop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Clone, Hash, Eq, PartialEq)]
-        struct DropKey(u64);
-        impl Drop for DropKey {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        #[derive(Clone)]
-        struct DropValue(#[allow(dead_code)] u64);
-        impl Drop for DropValue {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = drops();
         {
             let cache: super::Cache<DropKey, DropValue, BH> =
                 super::Cache::new(64, Default::default());
-            cache.insert(DropKey(1), DropValue(100));
-            cache.insert(DropKey(2), DropValue(200));
-            cache.insert(DropKey(3), DropValue(300));
-            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+            cache.insert(DropKey::new(1, &drops), DropValue::new(100, &drops));
+            cache.insert(DropKey::new(2, &drops), DropValue::new(200, &drops));
+            cache.insert(DropKey::new(3, &drops), DropValue::new(300, &drops));
+            assert_eq!(drops.get(), 0);
         }
         // 3 keys + 3 values = 6 drops
-        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 6);
+        assert_eq!(drops.get(), 6);
     }
 
     #[test]
     fn drop_on_eviction() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Clone, Hash, Eq, PartialEq)]
-        struct DropKey(u64);
-        impl Drop for DropKey {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        #[derive(Clone)]
-        struct DropValue(#[allow(dead_code)] u64);
-        impl Drop for DropValue {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
+        let drops = drops();
         {
             let cache: super::Cache<DropKey, DropValue, BH> =
                 super::Cache::new(64, Default::default());
-            cache.insert(DropKey(1), DropValue(100));
-            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+            cache.insert(DropKey::new(1, &drops), DropValue::new(100, &drops));
+            assert_eq!(drops.get(), 0);
             // Insert same key again - should evict old entry
-            cache.insert(DropKey(1), DropValue(200));
+            cache.insert(DropKey::new(1, &drops), DropValue::new(200, &drops));
             // Old key + old value dropped = 2
-            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+            assert_eq!(drops.get(), 2);
         }
         // Cache dropped: new key + new value = 2 more
-        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 4);
+        assert_eq!(drops.get(), 4);
     }
 
     #[test]
@@ -1263,6 +1281,51 @@ mod tests {
 
         cache.insert("key".to_string(), "value2".to_string());
         assert_eq!(cache.get("key"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn clear_slow_drops_entries() {
+        let drops = drops();
+        {
+            let cache: Cache<DropKey, DropValue> = new_cache(64);
+            cache.insert(DropKey::new(1, &drops), DropValue::new(100, &drops));
+            assert_eq!(drops.get(), 0);
+
+            cache.clear_slow();
+            assert_eq!(drops.get(), 2);
+
+            cache.insert(DropKey::new(1, &drops), DropValue::new(200, &drops));
+            assert_eq!(drops.get(), 2);
+        }
+        assert_eq!(drops.get(), 4);
+    }
+
+    #[test]
+    fn clear_slow_panic_does_not_double_drop_entry() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        #[derive(Clone)]
+        struct PanicOnFirstDrop(Drops);
+        impl Drop for PanicOnFirstDrop {
+            fn drop(&mut self) {
+                let prev = self.0.get();
+                self.0.set(prev + 1);
+                if prev == 0 {
+                    panic!("intentional panic from drop");
+                }
+            }
+        }
+
+        let drops = drops();
+        {
+            let cache: Cache<u64, PanicOnFirstDrop> = new_cache(64);
+            cache.insert(1, PanicOnFirstDrop(drops.clone()));
+
+            let result = catch_unwind(AssertUnwindSafe(|| cache.clear_slow()));
+            assert!(result.is_err());
+            assert_eq!(drops.get(), 1);
+        }
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]
