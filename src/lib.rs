@@ -274,9 +274,12 @@ where
     pub fn clear_slow(&self) {
         // SAFETY: We zero the entire bucket array. This is safe because:
         // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
-        // - We don't need to drop existing entries since we're zeroing the ALIVE_BIT.
-        // - Concurrent readers will see either the old state or zeros (empty).
+        // - Existing entries are dropped before their ALIVE_BIT is zeroed.
+        // - Callers ensure no other threads are accessing the cache.
         unsafe {
+            if Self::NEEDS_DROP {
+                ptr::drop_in_place(self.entries.cast_mut());
+            }
             ptr::write_bytes(
                 self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
                 0,
@@ -1263,6 +1266,43 @@ mod tests {
 
         cache.insert("key".to_string(), "value2".to_string());
         assert_eq!(cache.get("key"), Some("value2".to_string()));
+    }
+
+    #[test]
+    fn clear_slow_drops_entries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: Cache<DropKey, DropValue> = new_cache(64);
+            cache.insert(DropKey(1), DropValue(100));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+
+            cache.clear_slow();
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+
+            cache.insert(DropKey(1), DropValue(200));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 4);
     }
 
     #[test]
