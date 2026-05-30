@@ -262,7 +262,7 @@ where
         }
     }
 
-    /// Clears the cache by zeroing all bucket memory.
+    /// Clears the cache by invalidating all buckets.
     ///
     /// This is O(N) where N is the number of buckets. Prefer [`clear`](Self::clear) when
     /// [`CacheConfig::EPOCHS`] is `true`.
@@ -271,21 +271,24 @@ where
     ///
     /// This method is safe but may race with concurrent operations. Callers should ensure
     /// no other threads are accessing the cache during this operation.
+    #[inline(never)]
     pub fn clear_slow(&self) {
-        // SAFETY: We zero the entire bucket array. This is safe because:
-        // - Bucket<T> is repr(C) and zeroed memory is a valid empty bucket state.
-        // - Existing entries are dropped before their ALIVE_BIT is zeroed.
-        // - Callers ensure no other threads are accessing the cache.
+        // SAFETY: Callers ensure no other threads are accessing the cache. Existing entries are
+        // dropped after clearing their tags so the bucket won't be dropped again if dropping
+        // panics.
         unsafe {
-            let entries = self.entries.cast_mut().cast::<Bucket<(K, V)>>();
             if Self::NEEDS_DROP {
-                for i in 0..self.entries.len() {
-                    let entry = entries.add(i);
-                    ptr::drop_in_place(entry);
-                    ptr::write_bytes(entry, 0, 1);
+                for entry in &*self.entries {
+                    let tag = entry.tag.load(Ordering::Relaxed);
+                    entry.tag.store(0, Ordering::Relaxed);
+                    if tag & ALIVE_BIT != 0 {
+                        (*entry.data.get()).assume_init_drop();
+                    }
                 }
             } else {
-                ptr::write_bytes(entries, 0, self.entries.len());
+                for entry in &*self.entries {
+                    entry.tag.store(0, Ordering::Relaxed);
+                }
             }
         };
     }
