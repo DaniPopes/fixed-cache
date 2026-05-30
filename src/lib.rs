@@ -277,14 +277,16 @@ where
         // - Existing entries are dropped before their ALIVE_BIT is zeroed.
         // - Callers ensure no other threads are accessing the cache.
         unsafe {
+            let entries = self.entries.cast_mut().cast::<Bucket<(K, V)>>();
             if Self::NEEDS_DROP {
-                ptr::drop_in_place(self.entries.cast_mut());
+                for i in 0..self.entries.len() {
+                    let entry = entries.add(i);
+                    ptr::drop_in_place(entry);
+                    ptr::write_bytes(entry, 0, 1);
+                }
+            } else {
+                ptr::write_bytes(entries, 0, self.entries.len());
             }
-            ptr::write_bytes(
-                self.entries.cast_mut().cast::<Bucket<(K, V)>>(),
-                0,
-                self.entries.len(),
-            )
         };
     }
 
