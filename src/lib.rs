@@ -434,18 +434,21 @@ where
             // SAFETY: We hold the lock and bucket is alive. Lock-free readers only read.
             let (ck, v) = unsafe { (*data).assume_init_ref() };
             if key.equivalent(ck) {
-                let v = v.clone();
                 #[cfg(feature = "stats")]
                 if C::STATS
                     && let Some(stats) = &self.stats
                 {
-                    stats.record_remove(ck, &v);
+                    stats.record_remove(ck, v);
                 }
-                if Self::NEEDS_DROP {
-                    // SAFETY: We hold the lock, so we have exclusive access.
-                    unsafe { (*data).assume_init_drop() };
+                if !Self::NEEDS_DROP {
+                    let v = v.clone();
+                    bucket.unlock(if Self::LOCK_FREE_READS { next_version(prev) } else { 0 });
+                    return Some(v);
                 }
-                bucket.unlock(if Self::LOCK_FREE_READS { next_version(prev) } else { 0 });
+                // SAFETY: We hold the lock, so we have exclusive access.
+                let (k, v) = unsafe { (*data).assume_init_read() };
+                bucket.unlock(0);
+                drop(k);
                 return Some(v);
             }
             bucket.unlock(prev & !LOCKED_BIT);
