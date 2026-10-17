@@ -14,7 +14,7 @@ use core::{
     marker::PhantomData,
     mem::{self, MaybeUninit},
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{self, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
 };
 use equivalent::Equivalent;
 
@@ -32,6 +32,11 @@ const EPOCH_BITS: usize = 10;
 const EPOCH_SHIFT: usize = NEEDED_BITS;
 const EPOCH_MASK: usize = ((1 << EPOCH_BITS) - 1) << EPOCH_SHIFT;
 const EPOCH_NEEDED_BITS: usize = NEEDED_BITS + EPOCH_BITS;
+
+const VERSION_BITS: u32 = 8;
+const VERSION_SHIFT: u32 = usize::BITS - VERSION_BITS;
+const VERSION_MASK: usize = ((1usize << VERSION_BITS) - 1) << VERSION_SHIFT;
+const VERSION_INCREMENT: usize = 1usize << VERSION_SHIFT;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = core::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
@@ -66,6 +71,41 @@ pub trait CacheConfig {
     ///
     /// Defaults to `false`.
     const EPOCHS: bool = false;
+
+    /// Whether reads skip the bucket lock.
+    ///
+    /// When enabled, reads copy the entry out with atomic loads and then check that no writer
+    /// touched the bucket in the meantime (a seqlock), instead of locking the bucket. Cache hits
+    /// then never write to shared memory, which avoids a locked instruction on every hit and
+    /// cache-line contention between readers, at the cost of copying the entry on each read.
+    ///
+    /// Enabling this requires an `unsafe` acknowledgement; see [`LockFreeReads::enabled`].
+    ///
+    /// Defaults to [`LockFreeReads::DISABLED`].
+    const LOCK_FREE_READS: LockFreeReads = LockFreeReads::DISABLED;
+}
+
+/// Opt-in token for [`CacheConfig::LOCK_FREE_READS`].
+#[derive(Clone, Copy, Debug)]
+pub struct LockFreeReads(bool);
+
+impl LockFreeReads {
+    /// Reads lock the bucket.
+    pub const DISABLED: Self = Self(false);
+
+    /// Reads copy entries out of the bucket without locking it.
+    ///
+    /// # Safety
+    ///
+    /// The cache's key and value types `K` and `V` must:
+    /// - be valid to duplicate with a bitwise copy, as if they were [`Copy`]. Reads return such
+    ///   copies without calling [`Clone::clone`];
+    /// - not contain uninitialized bytes, and neither may `(K, V)`, including padding.
+    ///
+    /// Using this with types that need [`Drop`] fails to compile.
+    pub const unsafe fn enabled() -> Self {
+        Self(true)
+    }
 }
 
 /// Default cache configuration.
@@ -145,6 +185,14 @@ where
     C: CacheConfig,
 {
     const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+    const LOCK_FREE_READS: bool = {
+        let enabled = C::LOCK_FREE_READS.0;
+        assert!(
+            !enabled || !Self::NEEDS_DROP,
+            "lock-free reads require types that don't need drop"
+        );
+        enabled
+    };
 
     /// Create a new cache with the specified number of entries and hasher.
     ///
@@ -325,7 +373,27 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) -> Option<V> {
-        if bucket.try_lock(Some(tag)) {
+        if Self::LOCK_FREE_READS {
+            let seq = bucket.tag.load(Ordering::Acquire);
+            if seq & !VERSION_MASK == tag {
+                // SAFETY: Racy reads are atomic; the copy is only used if no writer intervened.
+                let data = unsafe { atomic_load(bucket.data.get().cast::<(K, V)>()) };
+                atomic::fence(Ordering::Acquire);
+                if bucket.tag.load(Ordering::Relaxed) == seq {
+                    // SAFETY: The tag did not change, so the copy is a complete entry.
+                    let (ck, v) = unsafe { data.assume_init() };
+                    if key.equivalent(&ck) {
+                        #[cfg(feature = "stats")]
+                        if C::STATS
+                            && let Some(stats) = &self.stats
+                        {
+                            stats.record_hit(&ck, &v);
+                        }
+                        return Some(v);
+                    }
+                }
+            }
+        } else if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
             // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
@@ -336,10 +404,10 @@ where
                     stats.record_hit(ck, v);
                 }
                 let v = v.clone();
-                bucket.unlock(tag);
+                bucket.unlock(prev);
                 return Some(v);
             }
-            bucket.unlock(tag);
+            bucket.unlock(prev);
         }
         #[cfg(feature = "stats")]
         if C::STATS
@@ -361,10 +429,10 @@ where
     /// Returns the value if the key was present in the cache.
     pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
-        if bucket.try_lock(Some(tag)) {
-            // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
-            let data = unsafe { &mut *bucket.data.get() };
-            let (ck, v) = unsafe { data.assume_init_ref() };
+        if let Some(prev) = bucket.try_lock_ret(Some(tag)) {
+            let data = bucket.data.get();
+            // SAFETY: We hold the lock and bucket is alive. Lock-free readers only read.
+            let (ck, v) = unsafe { (*data).assume_init_ref() };
             if key.equivalent(ck) {
                 let v = v.clone();
                 #[cfg(feature = "stats")]
@@ -375,12 +443,12 @@ where
                 }
                 if Self::NEEDS_DROP {
                     // SAFETY: We hold the lock, so we have exclusive access.
-                    unsafe { data.assume_init_drop() };
+                    unsafe { (*data).assume_init_drop() };
                 }
-                bucket.unlock(0);
+                bucket.unlock(if Self::LOCK_FREE_READS { next_version(prev) } else { 0 });
                 return Some(v);
             }
-            bucket.unlock(tag);
+            bucket.unlock(prev & !LOCKED_BIT);
         }
         None
     }
@@ -410,6 +478,27 @@ where
         let Some(prev_tag) = bucket.try_lock_ret(None) else {
             return;
         };
+
+        if Self::LOCK_FREE_READS {
+            // Publish the lock before any data write is visible to readers.
+            atomic::fence(Ordering::Release);
+            let entry = make_entry();
+            // SAFETY: We hold the lock; concurrent readers only use atomic loads.
+            unsafe {
+                #[cfg(feature = "stats")]
+                if C::STATS
+                    && let Some(stats) = &self.stats
+                {
+                    let is_alive = prev_tag & ALIVE_BIT != 0;
+                    let old = &*bucket.data.get().cast::<(K, V)>();
+                    stats.record_insert(&entry.0, &entry.1, is_alive.then_some((&old.0, &old.1)));
+                }
+                atomic_store(bucket.data.get().cast::<(K, V)>(), &entry);
+            }
+            mem::forget(entry);
+            bucket.unlock(tag | (next_version(prev_tag) & VERSION_MASK));
+            return;
+        }
 
         // SAFETY: We hold the lock, so we have exclusive access.
         unsafe {
@@ -529,7 +618,9 @@ where
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
         let mut tag = hash & self.tag_mask();
-        if Self::NEEDS_DROP {
+        if Self::LOCK_FREE_READS {
+            tag = (tag & !VERSION_MASK) | ALIVE_BIT;
+        } else if Self::NEEDS_DROP {
             tag |= ALIVE_BIT;
         }
         if C::EPOCHS {
@@ -585,15 +676,10 @@ impl<T> Bucket<T> {
     }
 
     #[inline]
-    fn try_lock(&self, expected: Option<usize>) -> bool {
-        self.try_lock_ret(expected).is_some()
-    }
-
-    #[inline]
     fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
-            if state != expected {
+            if state & !VERSION_MASK != expected & !VERSION_MASK {
                 return None;
             }
         } else if state & LOCKED_BIT != 0 {
@@ -624,6 +710,52 @@ impl<T> Drop for Bucket<T> {
         if Self::NEEDS_DROP && self.is_alive() {
             // SAFETY: `Drop` has exclusive access.
             unsafe { self.data.get_mut().assume_init_drop() };
+        }
+    }
+}
+
+#[inline(always)]
+const fn next_version(state: usize) -> usize {
+    state.wrapping_add(VERSION_INCREMENT) & VERSION_MASK
+}
+
+/// Copies a `T` out of `src` using relaxed atomic loads.
+#[inline(always)]
+unsafe fn atomic_load<T>(src: *const T) -> MaybeUninit<T> {
+    let mut dst = MaybeUninit::<T>::uninit();
+    let (s, d) = (src.cast::<u8>(), dst.as_mut_ptr().cast::<u8>());
+    let w = mem::size_of::<usize>();
+    let mut i = 0;
+    unsafe {
+        while i + w <= mem::size_of::<T>() {
+            // `AtomicPtr` preserves provenance if `T` contains pointers.
+            let x = AtomicPtr::<u8>::from_ptr(s.add(i).cast_mut().cast()).load(Ordering::Relaxed);
+            d.add(i).cast::<*mut u8>().write_unaligned(x);
+            i += w;
+        }
+        while i < mem::size_of::<T>() {
+            *d.add(i) = AtomicU8::from_ptr(s.add(i).cast_mut()).load(Ordering::Relaxed);
+            i += 1;
+        }
+    }
+    dst
+}
+
+/// Copies `src` into `dst` using relaxed atomic stores.
+#[inline(always)]
+unsafe fn atomic_store<T>(dst: *mut T, src: &T) {
+    let (s, d) = ((src as *const T).cast::<u8>(), dst.cast::<u8>());
+    let w = mem::size_of::<usize>();
+    let mut i = 0;
+    unsafe {
+        while i + w <= mem::size_of::<T>() {
+            let x = s.add(i).cast::<*mut u8>().read_unaligned();
+            AtomicPtr::from_ptr(d.add(i).cast()).store(x, Ordering::Relaxed);
+            i += w;
+        }
+        while i < mem::size_of::<T>() {
+            AtomicU8::from_ptr(d.add(i)).store(*s.add(i), Ordering::Relaxed);
+            i += 1;
         }
     }
 }
@@ -685,6 +817,13 @@ mod tests {
         const STATS: bool = false;
     }
     type NoStatsCache<K, V> = super::Cache<K, V, BH, NoStatsConfig>;
+
+    struct LockFreeConfig;
+    impl CacheConfig for LockFreeConfig {
+        // SAFETY: Only used with plain integer types.
+        const LOCK_FREE_READS: LockFreeReads = unsafe { LockFreeReads::enabled() };
+    }
+    type LockFreeCache<K, V> = super::Cache<K, V, BH, LockFreeConfig>;
 
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
@@ -1391,6 +1530,42 @@ mod tests {
                     _ => {
                         let _ = cache.remove(&(i % 50));
                     }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn lock_free_basic() {
+        let cache: LockFreeCache<u64, u64> = LockFreeCache::new(64, Default::default());
+
+        assert_eq!(cache.get(&1), None);
+        cache.insert(1, 100);
+        assert_eq!(cache.get(&1), Some(100));
+        cache.insert(1, 200);
+        assert_eq!(cache.get(&1), Some(200));
+
+        assert_eq!(cache.remove(&1), Some(200));
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.remove(&1), None);
+
+        assert_eq!(cache.get_or_insert_with(1, |&k| k * 3), 3);
+        assert_eq!(cache.get_or_insert_with(1, |_| unreachable!()), 3);
+    }
+
+    #[test]
+    fn lock_free_concurrent_reads_are_consistent() {
+        // A small cache so that writers constantly evict each other's entries.
+        let cache: LockFreeCache<u64, [u64; 8]> = LockFreeCache::new(4, Default::default());
+        let n = iters(10_000) as u64;
+
+        run_concurrent(4, |t| {
+            for i in 0..n {
+                let k = i % 16;
+                if t < 2 {
+                    cache.insert(k, [k; 8]);
+                } else if let Some(v) = cache.get(&k) {
+                    assert_eq!(v, [k; 8]);
                 }
             }
         });
