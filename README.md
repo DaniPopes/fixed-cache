@@ -10,6 +10,8 @@ with predictable memory usage and minimal overhead.
 
 - **Fixed size**: Memory is allocated once at creation time
 - **Lock-free reads**: Uses atomic operations for thread-safe access without blocking
+  - Opt-in seqlock reads for plain-data entries via `CacheConfig::LOCK_FREE_READS`, so cache
+    hits never write to shared memory
 - **Zero dependencies** (optional `rapidhash` for faster hashing)
 - **`no_std` compatible** (with `alloc`)
 - **Static initialization**: Create caches at compile time with the `static_cache!` macro
